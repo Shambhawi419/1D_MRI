@@ -115,7 +115,14 @@ def build_argparser() -> argparse.ArgumentParser:
                          "optimizer/scheduler and epoch counter reset to 1. "
                          "Ignored if a resumable 'latest.pt' is found in "
                          "--checkpoint-dir (resume takes priority).")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=2,
+                    help="Default 2 to match Colab's typical 2-CPU allocation -- "
+                         "raising this past your actual CPU count causes worker "
+                         "contention that starves the GPU rather than feeding it "
+                         "faster. Workers are kept alive across epochs "
+                         "(persistent_workers=True) so each worker's slice cache "
+                         "in FastMRICorpdDataset survives instead of being wiped "
+                         "and rebuilt from scratch every epoch.")
     return p
 
 
@@ -225,13 +232,20 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     train_set, val_set = build_train_and_val_sets(args)
+    # persistent_workers=True keeps worker processes (and each one's
+    # FastMRICorpdDataset slice cache) alive across epochs instead of
+    # respawning fresh -- and thus re-doing every slice's SVD/FFT
+    # preprocessing from scratch -- at the start of every single epoch.
+    use_workers = args.num_workers > 0
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                               num_workers=args.num_workers, drop_last=True)
+                               num_workers=args.num_workers, drop_last=True,
+                               persistent_workers=use_workers, pin_memory=torch.cuda.is_available())
 
     val_loader = None
     if val_set is not None:
         val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers)
+                                 num_workers=args.num_workers,
+                                 persistent_workers=use_workers, pin_memory=torch.cuda.is_available())
 
     model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width).to(args.device)
     criterion = ODLSLoss(n_coils=args.n_coils, sym_weight=args.sym_weight)

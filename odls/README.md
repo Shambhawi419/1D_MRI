@@ -129,10 +129,32 @@ rest of this codebase assumes:
   FOV. `crop_fe_to` / `crop_pe_to` are exposed as `--crop-fe-to` /
   `--crop-pe-to` on both `train.py` and `evaluate.py` -- keep them
   identical between training and evaluation of the same checkpoint.
-- **Memory**: fastMRI knee is far larger than the paper's original
-  datasets, so `FastMRICorpdDataset` loads and processes slices lazily
-  from disk (a small bounded LRU cache of recent slices) instead of
-  materializing whole volumes up front, unlike `ODLSHybridDataset`.
+- **Memory, and why the GPU can otherwise sit idle**: fastMRI knee is far
+  larger than the paper's original datasets, so `FastMRICorpdDataset`
+  loads and processes slices lazily from disk rather than materializing
+  whole volumes up front, unlike `ODLSHybridDataset`. Each slice's
+  preprocessing (coil-compression SVD plus the FE/PE FFT round-trips
+  above) is real CPU work, so it's cached per (file, slice) -- but with
+  `shuffle=True` scrambling access order at the row level, a *small*
+  cache almost never gets revisited before eviction, so this work would
+  otherwise be redone on nearly every sample, starving the GPU while the
+  CPU chases FFTs and SVDs (observed directly during Colab testing: GPU
+  memory near-idle while the first epoch crawled). `slice_cache_size`
+  therefore defaults to caching *every* slice in the dataset rather than
+  a small fixed number -- at `crop_fe_to`/`crop_pe_to`=224 and
+  `n_virtual_coils`=8 this is only a few MB per slice, so caching a
+  whole multi-file dataset costs a few GB of RAM, which is affordable.
+  This only pays off if the cache survives between epochs, though: with
+  `DataLoader(num_workers>0)`, each worker holds its own independent copy
+  of the dataset (and thus its own independent cache) since PyTorch
+  respawns worker processes fresh every epoch by default -- so
+  `train.py`'s DataLoaders are built with `persistent_workers=True`
+  whenever `--num-workers > 0`, keeping each worker (and its cache) alive
+  across all 300 epochs instead of rebuilding it from scratch every time.
+  `--num-workers` also now defaults to 2 rather than 4, since Colab's
+  typical 2-CPU allocation means more workers just causes contention
+  rather than faster loading (visible as a PyTorch `UserWarning` about
+  worker count if you push past your actual CPU count).
 
 Everything downstream -- row-wise sample construction, undersampling
 masks, the ODLS model, the loss -- is untouched; `FastMRICorpdDataset`

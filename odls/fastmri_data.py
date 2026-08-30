@@ -195,7 +195,7 @@ class FastMRICorpdDataset(Dataset):
                  n_virtual_coils: Optional[int] = 8, crop_fe_to: Optional[int] = 224,
                  crop_pe_to: Optional[int] = 224,
                  fixed_mask: bool = False, seed: Optional[int] = None,
-                 slice_cache_size: int = 8):
+                 slice_cache_size: Optional[int] = None):
         """crop_fe_to / crop_pe_to default to 224 (the paper's Sec. IV-A
         preprocessing target) and, critically, MUST be set to the same
         fixed value across every file for a given dataset instance:
@@ -206,6 +206,24 @@ class FastMRICorpdDataset(Dataset):
         know every file in `file_paths` shares the same native size on
         that axis (e.g. a single-source dataset), otherwise batching will
         fail as soon as two differently-sized files land in one batch.
+
+        slice_cache_size: how many (file, slice) preprocessed hybrid
+        arrays to keep in memory (each holding coil compression's SVD and
+        two FFT round-trips' worth of computed work). Left as None, this
+        defaults to caching every slice in `file_paths` -- with
+        `crop_fe_to`/`crop_pe_to` fixed at 224 and `n_virtual_coils=8`
+        each cached slice is only a few MB, so caching everything for a
+        dataset of a few dozen files costs a few GB of RAM, comfortably
+        affordable, and avoids redoing that SVD/FFT work on nearly every
+        sample -- which is what happens with a small cache under
+        `shuffle=True`, since row-level shuffling almost never revisits
+        the same slice twice in a row. Pass an explicit smaller value
+        only if you know your dataset is too large for this to fit in
+        memory. NOTE: with DataLoader `num_workers > 0`, each worker
+        process holds its own independent copy of this cache (it is not
+        shared across processes) -- pass `persistent_workers=True` to the
+        DataLoader (train.py already does) so each worker's cache survives
+        across epochs instead of being rebuilt from scratch every epoch.
         """
         if mask_type not in MASK_FACTORIES:
             raise ValueError(f"Unknown mask_type '{mask_type}', expected one of {list(MASK_FACTORIES)}")
@@ -237,7 +255,8 @@ class FastMRICorpdDataset(Dataset):
                 for row_idx in range(m):
                     self._index.append((f_idx, s_idx, row_idx))
 
-        self._slice_cache_size = slice_cache_size
+        total_slices = sum(self._slice_counts)
+        self._slice_cache_size = slice_cache_size if slice_cache_size is not None else total_slices
         self._slice_cache: Dict[tuple, np.ndarray] = {}
         self._slice_cache_order: List[tuple] = []
 
