@@ -44,6 +44,46 @@ the literal same run. `evaluate.py --checkpoint <path>` accepts any of
 the three formats too (`checkpoint_utils.load_model_weights` detects
 which one it's looking at).
 
+`odls_best.pt` is chosen by a trailing average of val_loss over the last
+`--best-checkpoint-window` epochs (default 5), not a single epoch's raw
+value -- a small validation set combined with BatchNorm's running
+statistics (computed only from randomly-masked training batches, not
+matching a fixed validation mask as well in every epoch) can make raw
+per-epoch val_loss noisy enough that a lucky low outlier would otherwise
+get locked in as "best" while genuinely better later epochs never
+overwrite it for not beating that fluke.
+
+## A real failure mode found during training: runaway soft-threshold
+
+Training on fastMRI CORPD_FBK surfaced a genuine architectural gap, not
+just an engineering bug: each phase's learnable soft-threshold (Sec.
+III-C.3, init 0.001) has no upper bound in the architecture as described,
+and nothing else in the model stops gradient descent from inflating it
+without limit. In practice it grew 250-800x within ~17 epochs (measured:
+0.24-0.87 across phases, from a 0.001 start), at which point it was
+suppressing nearly all signal passing through the sparsifying step --
+producing a near-all-zero reconstructed output (RLNE ~1.0, PSNR ~10dB,
+SSIM ~0 on the test set) despite training loss looking fine throughout
+(raw MSE on small-magnitude values doesn't punish "shrink everything
+toward zero" nearly as harshly as a scale-normalized metric like RLNE
+does -- which is exactly why this went unnoticed until a real test-set
+evaluation was run).
+
+The fix: `DeepSparseModule` (and `ODLSPhase` / `ODLS` above it) now take a
+`max_threshold` (default 0.05, exposed as `--max-threshold` on both
+`train.py` and `evaluate.py` -- keep it identical between training and
+evaluating the same checkpoint), and `_soft_threshold` clamps to
+`[0, max_threshold]` before applying the shrinkage. `ODLS.clamp_thresholds_()`
+additionally resets any already-out-of-range *stored* threshold value the
+moment a checkpoint is loaded (called from both train.py's resume path
+and `checkpoint_utils.load_model_weights`) -- the forward-pass clamp
+alone already makes model *behavior* correct regardless of the stored
+value, but leaving a stale out-of-range number sitting in the parameter
+is still worth cleaning up: Adam's leftover per-parameter momentum could
+otherwise keep nudging a value that can no longer affect output, and a
+stale large value would spring back to life with no real meaning if
+`max_threshold` is ever raised again in a later run.
+
 ## Design notes / where the source PDF was ambiguous
 
 The paper PDF's math symbols (Ψ, Φ, Γ, Ω, subscripts) were badly mangled by

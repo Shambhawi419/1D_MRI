@@ -24,3 +24,7 @@ def load_model_weights(model: ODLS, checkpoint_path: str, device: str) -> None:
     else:
         model.load_state_dict(checkpoint)
         print(f"loaded weights from {checkpoint_path}")
+
+    # Keeps a loaded checkpoint's stored threshold values consistent with
+    # the model's current max_threshold cap -- see ODLS.clamp_thresholds_.
+    model.clamp_thresholds_()

@@ -141,6 +141,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-coils", type=int, required=True)
     p.add_argument("--n-phases", type=int, default=10)
     p.add_argument("--width", type=int, default=48)
+    p.add_argument("--max-threshold", type=float, default=0.05,
+                    help="Must match whatever --max-threshold the checkpoint was "
+                         "trained with -- it's a construction-time hyperparameter, "
+                         "not part of the saved state_dict, so evaluate.py needs "
+                         "to be told the same value to reconstruct the model "
+                         "correctly.")
     p.add_argument("--mask-type", type=str, default="cartesian",
                     choices=["cartesian", "uniform", "partial_fourier"])
     p.add_argument("--af", type=float, default=4.0)
@@ -168,7 +174,8 @@ def load_test_volumes(args) -> List[np.ndarray]:
 def main():
     args = build_argparser().parse_args()
 
-    model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width).to(args.device)
+    model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width,
+                 max_threshold=args.max_threshold).to(args.device)
     load_model_weights(model, args.checkpoint, args.device)
 
     volumes = load_test_volumes(args)

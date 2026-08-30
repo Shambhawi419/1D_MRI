@@ -95,6 +95,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-coils", type=int, required=True)
     p.add_argument("--n-phases", type=int, default=10)
     p.add_argument("--width", type=int, default=48)
+    p.add_argument("--max-threshold", type=float, default=0.05,
+                    help="Upper bound on the learnable soft-threshold in each "
+                         "phase's deep-sparse module (init 0.001). Nothing else "
+                         "in the architecture stops this from growing unbounded; "
+                         "observed in practice to inflate 250-800x within ~17 "
+                         "epochs on fastMRI CORPD_FBK, at which point it "
+                         "suppressed nearly all signal and produced a near-zero "
+                         "(RLNE~1) output. Keep this consistent with whatever "
+                         "value a checkpoint was trained with when evaluating it.")
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -261,7 +270,8 @@ def main():
                                  num_workers=args.num_workers,
                                  persistent_workers=use_workers, pin_memory=torch.cuda.is_available())
 
-    model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width).to(args.device)
+    model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width,
+                 max_threshold=args.max_threshold).to(args.device)
     criterion = ODLSLoss(n_coils=args.n_coils, sym_weight=args.sym_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_decay)
@@ -274,6 +284,7 @@ def main():
     resume_state = None if args.no_resume else _load_resume_state(args.checkpoint_dir, args.device)
     if resume_state is not None:
         model.load_state_dict(resume_state["model_state_dict"])
+        model.clamp_thresholds_()
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         best_val_loss = resume_state["best_val_loss"]

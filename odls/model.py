@@ -89,20 +89,33 @@ class DeepSparseModule(nn.Module):
     learned forward/inverse sparsifying transforms (two 3-layer 1D CNNs,
     Sec. III-C.3), and lambda^(k) is a learnable soft threshold
     initialized to 0.001, allowed to vary per phase.
+
+    `max_threshold` caps how large lambda^(k) can grow. The paper doesn't
+    specify a ceiling, but nothing else in the architecture stops gradient
+    descent from inflating the threshold without bound -- observed in
+    practice (fastMRI CORPD_FBK training) growing 250-800x from its 0.001
+    init within ~17 epochs, at which point it was suppressing nearly all
+    signal through the sparsifying step (a soft-threshold that large zeros
+    out most values it's applied to), producing a near-all-zero output and
+    a worsening validation loss over subsequent epochs. Capping it keeps
+    the shrinkage useful without letting it collapse the output.
     """
 
-    def __init__(self, channels: int, width: int = 48, n_layers: int = 3):
+    def __init__(self, channels: int, width: int = 48, n_layers: int = 3,
+                 max_threshold: float = 0.05):
         super().__init__()
         self.psi2 = _make_conv_stack(channels, channels, n_layers, width)  # forward transform
         self.psi3 = _make_conv_stack(channels, channels, n_layers, width)  # inverse transform
         self.threshold = nn.Parameter(torch.tensor(0.001))
+        self.max_threshold = max_threshold
 
-    @staticmethod
-    def _soft_threshold(x: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
-        # clamp lam >= 0: a negative threshold would invert soft-thresholding
-        # into amplification, which is never the intended behavior of a
-        # learnable shrinkage threshold.
-        lam = torch.relu(lam)
+    def _soft_threshold(self, x: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
+        # clamp 0 <= lam <= max_threshold: a negative threshold would invert
+        # soft-thresholding into amplification (never intended for a
+        # learnable shrinkage threshold), and an unbounded-above threshold
+        # can grow large enough to suppress nearly all signal (observed in
+        # practice -- see class docstring).
+        lam = torch.clamp(lam, min=0.0, max=self.max_threshold)
         return torch.sign(x) * torch.relu(torch.abs(x) - lam)
 
     @staticmethod
@@ -146,13 +159,13 @@ class DeepSparseModule(nn.Module):
 class ODLSPhase(nn.Module):
     """One unrolled iteration: DLR -> DC -> DS (Fig. 4(a))."""
 
-    def __init__(self, n_coils: int, width: int = 48):
+    def __init__(self, n_coils: int, width: int = 48, max_threshold: float = 0.05):
         super().__init__()
         channels = 2 * n_coils  # real + imaginary stacked
         self.n_coils = n_coils
         self.dlr = DeepLowRankModule(channels, width=width, n_layers=6)
         self.dc = DataConsistencyModule()
-        self.ds = DeepSparseModule(channels, width=width, n_layers=3)
+        self.ds = DeepSparseModule(channels, width=width, n_layers=3, max_threshold=max_threshold)
 
     def forward(self, e_prev: torch.Tensor, z: torch.Tensor, mask: torch.Tensor):
         r = self.dlr(e_prev)
@@ -168,10 +181,12 @@ class ODLS(nn.Module):
     reconstruction performance and time consumption" (Sec. III-D).
     """
 
-    def __init__(self, n_coils: int, n_phases: int = 10, width: int = 48):
+    def __init__(self, n_coils: int, n_phases: int = 10, width: int = 48, max_threshold: float = 0.05):
         super().__init__()
         self.n_coils = n_coils
-        self.phases = nn.ModuleList([ODLSPhase(n_coils, width=width) for _ in range(n_phases)])
+        self.phases = nn.ModuleList([
+            ODLSPhase(n_coils, width=width, max_threshold=max_threshold) for _ in range(n_phases)
+        ])
         self._xavier_init()
 
     def _xavier_init(self):
@@ -180,6 +195,24 @@ class ODLS(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def clamp_thresholds_(self) -> None:
+        """In-place clamp of every phase's stored threshold parameter into
+        [0, max_threshold]. The forward pass already clamps the threshold
+        at use-time regardless (see DeepSparseModule._soft_threshold), so
+        this doesn't change model behavior -- it exists to keep a loaded
+        checkpoint's *stored* values consistent with the cap, rather than
+        leaving a stale out-of-range number sitting in the parameter that
+        could (a) still receive a few steps of Adam-momentum-driven drift
+        even though it can no longer affect output, or (b) spring back to
+        life with no real meaning if max_threshold is ever raised again in
+        a later run. Call this right after loading a checkpoint's weights,
+        before resuming or evaluating.
+        """
+        for phase in self.phases:
+            ds = phase.ds
+            ds.threshold.data.clamp_(min=0.0, max=ds.max_threshold)
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor):
         """
