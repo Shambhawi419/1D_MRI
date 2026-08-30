@@ -100,6 +100,15 @@ Everything downstream -- row-wise sample construction, undersampling
 masks, the ODLS model, the loss -- is untouched; `FastMRICorpdDataset`
 just produces the same `{"z", "e_ref", "mask"}` sample dict.
 
+### Running on Google Colab
+
+`../colab/ODLS_Colab.ipynb` is a ready-to-run Colab notebook for the case
+where the 20 downloaded fastMRI files live in Google Drive: it mounts
+Drive, stages/extracts the files onto local Colab disk, filters to
+CORPD_FBK via `find_corpd_files`, splits into train/val folders, clones
+this repo, and runs `train.py` / `evaluate.py`. Edit the **Config** cell
+(Drive folder path, coil counts, mask/AF) before running top to bottom.
+
 ## Usage (reference only -- not run as part of this delivery)
 
 ```
