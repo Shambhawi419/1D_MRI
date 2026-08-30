@@ -123,6 +123,20 @@ def build_argparser() -> argparse.ArgumentParser:
                          "(persistent_workers=True) so each worker's slice cache "
                          "in FastMRICorpdDataset survives instead of being wiped "
                          "and rebuilt from scratch every epoch.")
+    p.add_argument("--best-checkpoint-window", type=int, default=5,
+                    help="'odls_best.pt' is saved when the trailing average of "
+                         "val_loss over this many most-recent epochs improves on "
+                         "the best trailing average seen so far -- not when a "
+                         "single epoch's raw val_loss happens to be low. A small "
+                         "validation set can produce noisy per-epoch val_loss "
+                         "(e.g. from BatchNorm running statistics, computed only "
+                         "from randomly-masked training batches, not matching a "
+                         "fixed-mask validation set's activation distribution as "
+                         "well in some epochs); averaging over a short trailing "
+                         "window avoids locking in a lucky noisy dip as 'best' "
+                         "while a later, genuinely-better epoch never gets saved "
+                         "because it doesn't beat that outlier. Set to 1 to "
+                         "restore the old single-epoch behavior.")
     return p
 
 
@@ -253,7 +267,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_decay)
 
     start_epoch = 1
-    best_val_loss = float("inf")
+    best_val_loss = float("inf")  # kept for backward-compatible checkpoint metadata / logging
+    best_smoothed_val_loss = float("inf")
+    val_loss_history: List[float] = []
 
     resume_state = None if args.no_resume else _load_resume_state(args.checkpoint_dir, args.device)
     if resume_state is not None:
@@ -261,10 +277,17 @@ def main():
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         best_val_loss = resume_state["best_val_loss"]
+        # .get() with defaults: a "latest.pt" saved before this smoothing
+        # feature existed won't have these keys -- the trailing window just
+        # starts fresh in that case rather than erroring.
+        best_smoothed_val_loss = resume_state.get("best_smoothed_val_loss", float("inf"))
+        val_loss_history = resume_state.get("val_loss_history", [])
         start_epoch = resume_state["epoch"] + 1
         print(f"resumed from {os.path.join(args.checkpoint_dir, 'latest.pt')}: "
               f"continuing at epoch {start_epoch}/{args.epochs} "
-              f"(best_val_loss so far = {best_val_loss:.6f})")
+              f"(best_val_loss so far = {best_val_loss:.6f}, "
+              f"best {args.best_checkpoint_window}-epoch trailing avg so far = "
+              f"{best_smoothed_val_loss:.6f})")
     elif args.init_checkpoint:
         load_model_weights(model, args.init_checkpoint, args.device)
         print("optimizer/scheduler/epoch counter starting fresh from epoch 1 "
@@ -292,6 +315,15 @@ def main():
             msg += f" | val_loss={val_stats['loss']:.6f}"
             if val_stats["loss"] < best_val_loss:
                 best_val_loss = val_stats["loss"]
+
+            val_loss_history.append(val_stats["loss"])
+            if len(val_loss_history) > args.best_checkpoint_window:
+                val_loss_history.pop(0)
+            smoothed_val_loss = sum(val_loss_history) / len(val_loss_history)
+            msg += f" | val_loss_avg{len(val_loss_history)}={smoothed_val_loss:.6f}"
+
+            if smoothed_val_loss < best_smoothed_val_loss:
+                best_smoothed_val_loss = smoothed_val_loss
                 torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "odls_best.pt"))
 
         print(msg)
@@ -301,6 +333,8 @@ def main():
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
+            "best_smoothed_val_loss": best_smoothed_val_loss,
+            "val_loss_history": val_loss_history,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
