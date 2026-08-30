@@ -20,12 +20,14 @@ from typing import List
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from data import fe_ifft, pe_ifft, _to_real_imag_channels
 from masks import MASK_FACTORIES
 from metrics import coil_combine_sos, rlne, psnr, ssim
 from model import ODLS
 from fastmri_data import find_corpd_files, load_fastmri_volume
+from checkpoint_utils import load_model_weights
 
 
 def reconstruct_slice(model: ODLS, k_space_slice: np.ndarray, mask: np.ndarray,
@@ -66,6 +68,9 @@ def evaluate_dataset(model: ODLS, volumes: List[np.ndarray], mask_type: str,
     rng = np.random.default_rng(seed)
     mask_factory = MASK_FACTORIES[mask_type]
 
+    total_slices = sum(vol.shape[0] for vol in volumes)
+    progress = tqdm(total=total_slices, desc=f"testing ({len(volumes)} volumes)")
+
     rlnes, psnrs, ssims = [], [], []
     for vol in volumes:  # (n_slices, M, N, J)
         n_slices, M, N, J = vol.shape
@@ -92,9 +97,15 @@ def evaluate_dataset(model: ODLS, volumes: List[np.ndarray], mask_type: str,
             ref_mag = coil_combine_sos(ref_ch.flatten(2), J).view(1, M, N)
             hat_mag = coil_combine_sos(hat_ch.flatten(2), J).view(1, M, N)
 
-            rlnes.append(rlne(ref_mag, hat_mag).item())
+            slice_rlne = rlne(ref_mag, hat_mag).item()
+            rlnes.append(slice_rlne)
             psnrs.append(psnr(ref_mag, hat_mag).item())
             ssims.append(ssim(ref_mag, hat_mag).item())
+
+            progress.set_postfix(rlne=f"{slice_rlne:.4f}")
+            progress.update(1)
+
+    progress.close()
 
     return {
         "RLNE_mean": float(np.mean(rlnes)), "RLNE_std": float(np.std(rlnes)),
@@ -117,7 +128,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--fastmri-fat-suppressed", action="store_true")
     p.add_argument("--n-virtual-coils", type=int, default=8,
                     help="Must equal --n-coils when using --fastmri-test-root.")
-    p.add_argument("--crop-fe-to", type=int, default=None)
+    p.add_argument("--crop-fe-to", type=int, default=224,
+                    help="Must match whatever --crop-fe-to the checkpoint was "
+                         "trained with (default: 224). Forcing every test file "
+                         "to the same size also prevents a batching crash if "
+                         "you evaluate more than one file at once.")
+    p.add_argument("--crop-pe-to", type=int, default=224,
+                    help="Must match whatever --crop-pe-to the checkpoint was "
+                         "trained with (default: 224).")
 
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--n-coils", type=int, required=True)
@@ -142,7 +160,8 @@ def load_test_volumes(args) -> List[np.ndarray]:
             raise ValueError(f"No matching CORPD{'FS' if args.fastmri_fat_suppressed else ''}_FBK "
                               f"files found under {args.fastmri_test_root}")
         return [load_fastmri_volume(p, n_virtual_coils=args.n_virtual_coils,
-                                     crop_fe_to=args.crop_fe_to) for p in paths]
+                                     crop_fe_to=args.crop_fe_to,
+                                     crop_pe_to=args.crop_pe_to) for p in paths]
     return [np.load(p) for p in args.test_volumes]
 
 
@@ -150,8 +169,7 @@ def main():
     args = build_argparser().parse_args()
 
     model = ODLS(n_coils=args.n_coils, n_phases=args.n_phases, width=args.width).to(args.device)
-    state_dict = torch.load(args.checkpoint, map_location=args.device)
-    model.load_state_dict(state_dict)
+    load_model_weights(model, args.checkpoint, args.device)
 
     volumes = load_test_volumes(args)
     results = evaluate_dataset(model, volumes, args.mask_type, args.af, args.device)

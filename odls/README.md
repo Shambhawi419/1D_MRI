@@ -15,9 +15,34 @@ PyTorch implementation of the architecture described in:
 | `model.py`    | Sec. III-C (DLR/DC/DS modules, Eqs. 12-14) + Sec. III-D (network architecture, Fig. 4) |
 | `losses.py`   | Eq. 15 (reconstruction + symmetry loss) |
 | `metrics.py`  | Supplement S1 (RLNE, PSNR, SSIM) |
-| `train.py`    | Sec. III-D training configuration (Adam, lr schedule, batch size, epochs) |
-| `evaluate.py` | Sec. III-D inference flow (Fig. 6): reconstruct rows in parallel, stitch, final PE IFT |
+| `train.py`    | Sec. III-D training configuration (Adam, lr schedule, batch size, epochs); tqdm progress bars; per-epoch Drive-safe checkpointing with auto-resume and `--init-checkpoint` pretraining |
+| `evaluate.py` | Sec. III-D inference flow (Fig. 6): reconstruct rows in parallel, stitch, final PE IFT; tqdm progress bar over test slices |
 | `fastmri_data.py` | Adapter for training/evaluating on the fastMRI knee multicoil dataset (see below) |
+| `checkpoint_utils.py` | Shared checkpoint loader used by both `train.py` and `evaluate.py` |
+
+## Checkpointing, resuming, and pretraining
+
+`train.py` writes to `--checkpoint-dir` every single epoch:
+
+- **`latest.pt`** -- the full training state (model + optimizer + scheduler
+  + epoch + best_val_loss). If training is interrupted (a Colab
+  disconnect, a crash, anything), re-running the exact same command with
+  the same `--checkpoint-dir` picks up automatically from the next epoch
+  instead of restarting at epoch 1. Point `--checkpoint-dir` at a
+  persistent location (e.g. Google Drive in Colab) -- it's local disk
+  otherwise, which is wiped on a Colab runtime reset.
+- **`odls_best.pt`** -- plain model weights, written whenever validation
+  loss improves.
+- **`odls_final.pt`** -- plain model weights, written once training
+  finishes.
+
+Use `--init-checkpoint <path>` to load weights from any of the three as a
+*pretrained* starting point for a new run (new data, new mask/AF,
+fine-tuning) with a fresh optimizer/scheduler and epoch counter reset to
+1 -- this is different from the automatic resume above, which continues
+the literal same run. `evaluate.py --checkpoint <path>` accepts any of
+the three formats too (`checkpoint_utils.load_model_weights` detects
+which one it's looking at).
 
 ## Design notes / where the source PDF was ambiguous
 
@@ -85,12 +110,25 @@ rest of this codebase assumes:
   count anyway. `coil_compress()` applies the SVD-based virtual-coil
   compression the paper itself cites (ref. [49], Zhang et al.) down to a
   fixed `n_virtual_coils` (default 8, matching the paper).
-- **Readout oversampling**: fastMRI's raw readout (frequency-encoding)
-  axis is acquired at 2x oversampling. `remove_readout_oversampling()`
-  inverse-FFTs to image space, center-crops to half the readout length
-  (or a custom `crop_fe_to`), and FFTs back to a properly-sized k-space
-  before it ever reaches the row-wise 1D sample construction in
-  `data.py`.
+- **Readout oversampling, and non-uniform matrix sizes across files**:
+  fastMRI's raw readout (frequency-encoding) axis is acquired at 2x
+  oversampling, and both the readout size and the phase-encoding width
+  vary from file to file. Left alone, this crashes DataLoader batching
+  the instant two differently-shaped samples land in the same batch (this
+  actually happened during Colab testing). `_resize_via_kspace()` forces
+  both spatial axes to an exact fixed target size via an ifft /
+  center-crop-or-zero-pad / fft round trip -- `remove_readout_oversampling()`
+  applies it to the FE axis (default target: 224, matching the paper's
+  Sec. IV-A "224x224" preprocessing) and `resize_pe()` applies it to the
+  PE axis (same default). This is deliberately a *round trip through
+  image space*, not a raw truncation of k-space samples: cropping k-space
+  directly would reduce resolution (a low-pass effect) rather than
+  reducing the reconstructed FOV, which is what "center-cropped to
+  224x224" actually means. Zero-padding (when a file is smaller than the
+  target) is the resolution-preserving mirror operation for enlarging the
+  FOV. `crop_fe_to` / `crop_pe_to` are exposed as `--crop-fe-to` /
+  `--crop-pe-to` on both `train.py` and `evaluate.py` -- keep them
+  identical between training and evaluation of the same checkpoint.
 - **Memory**: fastMRI knee is far larger than the paper's original
   datasets, so `FastMRICorpdDataset` loads and processes slices lazily
   from disk (a small bounded LRU cache of recent slices) instead of

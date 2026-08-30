@@ -9,26 +9,51 @@ Training script for ODLS, matching Sec. III-D's stated configuration:
   - K = 10 unrolled phases
   - Each conv layer: 48 1D filters, kernel size 3
 
-This script only wires the pieces together (model, loss, data, optimizer,
+Checkpointing / resume / pretraining
+-------------------------------------
+Every epoch, a full training-state checkpoint ("latest.pt": model,
+optimizer, scheduler, epoch number, best_val_loss) is written to
+--checkpoint-dir, unconditionally -- so if the process is interrupted
+(e.g. a Colab disconnect), re-running with the same --checkpoint-dir
+automatically picks up where it left off, rather than restarting at
+epoch 1. In addition, "odls_best.pt" (plain model weights only) is
+written whenever validation loss improves, and "odls_final.pt" (also
+plain weights) once training completes -- both directly loadable by
+evaluate.py, or by anyone else's script, for inference.
+
+--init-checkpoint is the separate "use these weights as pretraining"
+path: it loads only the model weights from any checkpoint (any of
+odls_best.pt / odls_final.pt / latest.pt) into a freshly-initialized
+optimizer and scheduler, starting again from epoch 1 -- unlike --resume,
+which restores the *entire* run (optimizer/scheduler/epoch too) so
+training continues exactly where it left off. Use --init-checkpoint when
+starting a new run (new data, new mask/AF, fine-tuning, etc.) from
+previously learned weights; --resume only applies to continuing the
+literal same run after an interruption, and takes priority over
+--init-checkpoint if both a resumable "latest.pt" and --init-checkpoint
+are present.
+
+This script wires the pieces together (model, loss, data, optimizer,
 schedule); it expects the caller to supply fully-sampled k-space volumes
-(the paper's in-vivo knee/brain datasets are not public). Not executed
-here -- provided as a ready-to-run reference implementation.
+(the paper's in-vivo knee/brain datasets are not public).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from data import ODLSHybridDataset
 from losses import ODLSLoss
 from model import ODLS
 from fastmri_data import FastMRICorpdDataset, find_corpd_files
+from checkpoint_utils import load_model_weights
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -51,9 +76,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--n-virtual-coils", type=int, default=8,
                     help="SVD coil-compression target for fastMRI inputs "
                          "(ignored for --train-volumes). Must equal --n-coils.")
-    p.add_argument("--crop-fe-to", type=int, default=None,
-                    help="Readout size after removing fastMRI's 2x oversampling "
-                         "(default: half the raw readout size).")
+    p.add_argument("--crop-fe-to", type=int, default=224,
+                    help="Readout (FE) size to force every fastMRI slice to, via "
+                         "an ifft/crop-or-pad/fft round-trip (default: 224, "
+                         "matching the paper's Sec. IV-A preprocessing). Pass "
+                         "None only if every file already shares the same "
+                         "native readout size -- otherwise DataLoader batching "
+                         "crashes the moment two differently-sized files meet "
+                         "in the same batch.")
+    p.add_argument("--crop-pe-to", type=int, default=224,
+                    help="Phase-encoding (PE) size to force every fastMRI slice "
+                         "to, same round-trip and same batching rationale as "
+                         "--crop-fe-to (default: 224).")
 
     p.add_argument("--mask-type", type=str, default="cartesian",
                     choices=["cartesian", "uniform", "partial_fourier"])
@@ -67,7 +101,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr-decay", type=float, default=0.99)
     p.add_argument("--sym-weight", type=float, default=0.01)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints",
+                    help="Should point into a persistent location (e.g. a Google "
+                         "Drive path in Colab) -- this is where 'latest.pt' is "
+                         "written every epoch and where a resume is read from.")
+    p.add_argument("--no-resume", action="store_true",
+                    help="Ignore any existing 'latest.pt' in --checkpoint-dir and "
+                         "start fresh from epoch 1 instead of resuming.")
+    p.add_argument("--init-checkpoint", type=str, default=None,
+                    help="Load model weights from this checkpoint (any of "
+                         "odls_best.pt / odls_final.pt / latest.pt) as a "
+                         "pretrained starting point, with a freshly-initialized "
+                         "optimizer/scheduler and epoch counter reset to 1. "
+                         "Ignored if a resumable 'latest.pt' is found in "
+                         "--checkpoint-dir (resume takes priority).")
     p.add_argument("--num-workers", type=int, default=4)
     return p
 
@@ -85,13 +132,16 @@ def load_volumes(paths: List[str]) -> List[np.ndarray]:
 
 
 def run_epoch(model: ODLS, loader: DataLoader, criterion: ODLSLoss,
-              optimizer, device: str, train: bool) -> dict:
+              optimizer, device: str, train: bool, epoch: int, total_epochs: int) -> dict:
     model.train(mode=train)
     total_loss, total_err, total_sym, n_batches = 0.0, 0.0, 0.0, 0
 
+    phase_name = "train" if train else "val"
+    progress = tqdm(loader, desc=f"epoch {epoch}/{total_epochs} [{phase_name}]", leave=False)
+
     context = torch.enable_grad() if train else torch.no_grad()
     with context:
-        for batch in loader:
+        for batch in progress:
             z = batch["z"].to(device)
             e_ref = batch["e_ref"].to(device)
             mask = batch["mask"].to(device)
@@ -108,6 +158,7 @@ def run_epoch(model: ODLS, loader: DataLoader, criterion: ODLSLoss,
             total_err += parts["err"].item()
             total_sym += parts["sym"].item()
             n_batches += 1
+            progress.set_postfix(loss=f"{total_loss / n_batches:.6f}")
 
     return {
         "loss": total_loss / max(n_batches, 1),
@@ -134,6 +185,7 @@ def build_train_and_val_sets(args):
         train_set = FastMRICorpdDataset(
             train_files, mask_type=args.mask_type, af=args.af,
             n_virtual_coils=args.n_virtual_coils, crop_fe_to=args.crop_fe_to,
+            crop_pe_to=args.crop_pe_to,
         )
 
         val_set = None
@@ -145,6 +197,7 @@ def build_train_and_val_sets(args):
             val_set = FastMRICorpdDataset(
                 val_files, mask_type=args.mask_type, af=args.af,
                 n_virtual_coils=args.n_virtual_coils, crop_fe_to=args.crop_fe_to,
+                crop_pe_to=args.crop_pe_to,
                 fixed_mask=True, seed=0,
             )
         return train_set, val_set
@@ -158,6 +211,13 @@ def build_train_and_val_sets(args):
         val_set = ODLSHybridDataset(val_volumes, mask_type=args.mask_type, af=args.af,
                                      fixed_mask=True, seed=0)
     return train_set, val_set
+
+
+def _load_resume_state(checkpoint_dir: str, device: str) -> Optional[dict]:
+    latest_path = os.path.join(checkpoint_dir, "latest.pt")
+    if not os.path.exists(latest_path):
+        return None
+    return torch.load(latest_path, map_location=device)
 
 
 def main():
@@ -178,9 +238,33 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_decay)
 
+    start_epoch = 1
     best_val_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        train_stats = run_epoch(model, train_loader, criterion, optimizer, args.device, train=True)
+
+    resume_state = None if args.no_resume else _load_resume_state(args.checkpoint_dir, args.device)
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model_state_dict"])
+        optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        best_val_loss = resume_state["best_val_loss"]
+        start_epoch = resume_state["epoch"] + 1
+        print(f"resumed from {os.path.join(args.checkpoint_dir, 'latest.pt')}: "
+              f"continuing at epoch {start_epoch}/{args.epochs} "
+              f"(best_val_loss so far = {best_val_loss:.6f})")
+    elif args.init_checkpoint:
+        load_model_weights(model, args.init_checkpoint, args.device)
+        print("optimizer/scheduler/epoch counter starting fresh from epoch 1 "
+              "(pretrained weights only -- use --resume-style 'latest.pt' "
+              "instead if you meant to continue this exact run).")
+
+    if start_epoch > args.epochs:
+        print(f"checkpoint already reached epoch {start_epoch - 1} >= --epochs "
+              f"{args.epochs}; nothing to do.")
+        return
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_stats = run_epoch(model, train_loader, criterion, optimizer, args.device,
+                                 train=True, epoch=epoch, total_epochs=args.epochs)
         scheduler.step()
 
         msg = (f"epoch {epoch:3d}/{args.epochs} | "
@@ -189,13 +273,25 @@ def main():
                f"lr={scheduler.get_last_lr()[0]:.6f}")
 
         if val_loader is not None:
-            val_stats = run_epoch(model, val_loader, criterion, optimizer, args.device, train=False)
+            val_stats = run_epoch(model, val_loader, criterion, optimizer, args.device,
+                                   train=False, epoch=epoch, total_epochs=args.epochs)
             msg += f" | val_loss={val_stats['loss']:.6f}"
             if val_stats["loss"] < best_val_loss:
                 best_val_loss = val_stats["loss"]
                 torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "odls_best.pt"))
 
         print(msg)
+
+        # Always saved, every epoch, so a resume never loses more than the
+        # epoch currently in progress at the time of an interruption.
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_loss": best_val_loss,
+            "args": vars(args),
+        }, os.path.join(args.checkpoint_dir, "latest.pt"))
 
     torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "odls_final.pt"))
 

@@ -78,34 +78,90 @@ def coil_compress(kspace_mnj: np.ndarray, n_virtual_coils: int) -> np.ndarray:
     return compressed.reshape(M, N, n_virtual_coils).astype(np.complex64)
 
 
-def remove_readout_oversampling(kspace_mnj: np.ndarray, target_m: Optional[int] = None) -> np.ndarray:
-    """Removes the 2x readout oversampling fastMRI raw k-space carries
-    along the frequency-encoding axis (axis 0 here, M): inverse-FFT to
-    image space, center-crop to `target_m` rows (default: M // 2, the
-    standard 2x factor), then FFT back to a properly reduced-FOV k-space
-    of shape (target_m, N, J).
+def _resize_via_kspace(kspace_mnj: np.ndarray, axis: int, target_size: Optional[int]) -> np.ndarray:
+    """Forces `kspace_mnj`'s size along `axis` to exactly `target_size` by
+    inverse-FFTing to image space, center-cropping (if the axis is larger
+    than target) or zero-padding (if smaller) around the center, then
+    FFTing back to k-space.
+
+    This is the physically correct way to change the reconstructed
+    image's matrix size along one axis while leaving the encoded
+    resolution/content alone -- unlike truncating k-space directly
+    (dropping outer/high-frequency samples), which instead reduces
+    resolution (a low-pass effect) and does NOT correspond to "center-
+    cropping the image" the way the paper's Sec. IV-A preprocessing does.
+    Zero-padding k-space is the mirror-image, resolution-preserving way
+    to *enlarge* the FOV when a source file is smaller than the target
+    (standard "zero-fill interpolation").
+
+    Forcing every slice to the exact same target size on both spatial
+    axes (not just when it happens to need cropping) is what guarantees
+    every sample in a batch has an identical shape -- fastMRI knee
+    volumes vary in both readout size and phase-encoding width from file
+    to file, and PyTorch's default collate crashes the instant two
+    samples in the same batch disagree on either axis.
     """
-    M, N, J = kspace_mnj.shape
-    if target_m is None:
-        target_m = M // 2
-    if target_m >= M:
+    if target_size is None:
         return kspace_mnj
 
-    img = np.fft.fftshift(np.fft.ifft(np.fft.ifftshift(kspace_mnj, axes=0), axis=0, norm="ortho"), axes=0)
-    start = (M - target_m) // 2
-    img_cropped = img[start:start + target_m]
-    ks_cropped = np.fft.fftshift(
-        np.fft.fft(np.fft.ifftshift(img_cropped, axes=0), axis=0, norm="ortho"), axes=0
-    )
-    return ks_cropped.astype(np.complex64)
+    current = kspace_mnj.shape[axis]
+    if current == target_size:
+        return kspace_mnj
+
+    img = np.fft.fftshift(np.fft.ifft(np.fft.ifftshift(kspace_mnj, axes=axis), axis=axis, norm="ortho"), axes=axis)
+
+    if current > target_size:
+        start = (current - target_size) // 2
+        slicer = [slice(None)] * kspace_mnj.ndim
+        slicer[axis] = slice(start, start + target_size)
+        img = img[tuple(slicer)]
+    else:
+        pad_total = target_size - current
+        pad_before = pad_total // 2
+        pad_after = pad_total - pad_before
+        pad_width = [(0, 0)] * kspace_mnj.ndim
+        pad_width[axis] = (pad_before, pad_after)
+        img = np.pad(img, pad_width, mode="constant")
+
+    ks = np.fft.fftshift(np.fft.fft(np.fft.ifftshift(img, axes=axis), axis=axis, norm="ortho"), axes=axis)
+    return ks.astype(np.complex64)
+
+
+def remove_readout_oversampling(kspace_mnj: np.ndarray, target_m: Optional[int] = None) -> np.ndarray:
+    """Removes the 2x readout oversampling fastMRI raw k-space carries
+    along the frequency-encoding axis (axis 0 here, M): resizes (via
+    _resize_via_kspace) to `target_m` rows, default M // 2 (the standard
+    2x factor) when `target_m` isn't given.
+    """
+    if target_m is None:
+        target_m = kspace_mnj.shape[0] // 2
+    return _resize_via_kspace(kspace_mnj, axis=0, target_size=target_m)
+
+
+def resize_pe(kspace_mnj: np.ndarray, target_n: Optional[int]) -> np.ndarray:
+    """Forces the phase-encoding axis (axis 1, N) to exactly `target_n`,
+    matching the paper's "center-cropped to 224x224" preprocessing
+    (Sec. IV-A) and, just as importantly, guaranteeing every fastMRI
+    sample has identical N so DataLoader batching can never crash on a
+    shape mismatch, however the raw files vary."""
+    return _resize_via_kspace(kspace_mnj, axis=1, target_size=target_n)
 
 
 def load_fastmri_volume(path: str, n_virtual_coils: Optional[int] = 8,
-                         crop_fe_to: Optional[int] = None) -> np.ndarray:
+                         crop_fe_to: Optional[int] = 224,
+                         crop_pe_to: Optional[int] = 224) -> np.ndarray:
     """Loads one fastMRI .h5 volume and returns a (n_slices, M, N, J)
-    complex64 k-space array in this project's convention (coils last),
-    with optional coil compression and readout-oversampling removal
-    applied per slice.
+    complex64 k-space array in this project's convention (coils last).
+
+    Defaults to 224 on both spatial axes, matching the paper's Sec. IV-A
+    "center-cropped to 224x224" preprocessing. This isn't just cosmetic:
+    fastMRI knee files vary in both readout size and phase-encoding width
+    from file to file, so forcing every slice -- from every file -- to
+    the exact same (crop_fe_to, crop_pe_to) is what prevents a shape
+    mismatch crash when the DataLoader batches slices from different
+    files together. crop_fe_to=None restores the old "just remove 2x
+    oversampling, keep native size" behavior (not batch-safe across a
+    mixed set of files); crop_pe_to=None disables PE resizing entirely.
     """
     with h5py.File(path, "r") as hf:
         kspace = hf["kspace"][()]  # (n_slices, n_coils, H, W), complex64
@@ -115,9 +171,8 @@ def load_fastmri_volume(path: str, n_virtual_coils: Optional[int] = 8,
     processed_slices = []
     for s in range(kspace.shape[0]):
         sl = kspace[s]
-        if crop_fe_to is not None or crop_fe_to is None:
-            # default behavior removes the standard 2x oversampling
-            sl = remove_readout_oversampling(sl, target_m=crop_fe_to)
+        sl = remove_readout_oversampling(sl, target_m=crop_fe_to)
+        sl = resize_pe(sl, target_n=crop_pe_to)
         if n_virtual_coils is not None:
             sl = coil_compress(sl, n_virtual_coils)
         processed_slices.append(sl)
@@ -137,9 +192,21 @@ class FastMRICorpdDataset(Dataset):
     """
 
     def __init__(self, file_paths: List[str], mask_type: str = "cartesian", af: float = 4.0,
-                 n_virtual_coils: Optional[int] = 8, crop_fe_to: Optional[int] = None,
+                 n_virtual_coils: Optional[int] = 8, crop_fe_to: Optional[int] = 224,
+                 crop_pe_to: Optional[int] = 224,
                  fixed_mask: bool = False, seed: Optional[int] = None,
                  slice_cache_size: int = 8):
+        """crop_fe_to / crop_pe_to default to 224 (the paper's Sec. IV-A
+        preprocessing target) and, critically, MUST be set to the same
+        fixed value across every file for a given dataset instance:
+        fastMRI knee files vary in both readout size and phase-encoding
+        width, and PyTorch's default collate_fn crashes the moment two
+        samples in the same batch disagree on shape. Passing None for
+        either disables that axis's resizing -- only safe if you already
+        know every file in `file_paths` shares the same native size on
+        that axis (e.g. a single-source dataset), otherwise batching will
+        fail as soon as two differently-sized files land in one batch.
+        """
         if mask_type not in MASK_FACTORIES:
             raise ValueError(f"Unknown mask_type '{mask_type}', expected one of {list(MASK_FACTORIES)}")
         if not file_paths:
@@ -150,6 +217,7 @@ class FastMRICorpdDataset(Dataset):
         self.af = af
         self.n_virtual_coils = n_virtual_coils
         self.crop_fe_to = crop_fe_to
+        self.crop_pe_to = crop_pe_to
         self.fixed_mask = fixed_mask
         self.rng = np.random.default_rng(seed)
         self._fixed_masks: Dict[int, np.ndarray] = {}
@@ -189,6 +257,7 @@ class FastMRICorpdDataset(Dataset):
         raw = np.transpose(raw, (1, 2, 0))  # (H, W, n_coils) = (M_raw, N, J_raw)
 
         raw = remove_readout_oversampling(raw, target_m=self.crop_fe_to)
+        raw = resize_pe(raw, target_n=self.crop_pe_to)
         if self.n_virtual_coils is not None:
             raw = coil_compress(raw, self.n_virtual_coils)
 
