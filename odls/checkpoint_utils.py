@@ -7,6 +7,17 @@ either of the two formats train.py can produce is accepted everywhere:
     for "odls_best.pt" / "odls_final.pt", or
   - a full training-state dict (train.py's per-epoch "latest.pt"), with
     a "model_state_dict" key alongside optimizer/scheduler/epoch state.
+
+IMPORTANT -- data-scale breaking change: fastmri_data.py now normalizes
+every slice's k-space amplitude (see compute_normalization_scale), which
+did not happen before. A checkpoint trained before that change has every
+weight tuned to the old (~1e-5 magnitude) input scale; loading it now and
+continuing training (via --init-checkpoint or a resume) would feed those
+weights a completely different input distribution (~O(1) magnitude) than
+they were ever trained on. This function will load such a checkpoint
+without error (the state_dict shapes/keys are unaffected), but the
+resulting model's behavior on real data should not be trusted -- start
+training from a fresh checkpoint directory instead.
 """
 
 from __future__ import annotations

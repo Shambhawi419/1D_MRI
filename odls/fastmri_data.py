@@ -147,6 +147,38 @@ def resize_pe(kspace_mnj: np.ndarray, target_n: Optional[int]) -> np.ndarray:
     return _resize_via_kspace(kspace_mnj, axis=1, target_size=target_n)
 
 
+def compute_normalization_scale(kspace_mnj: np.ndarray, eps: float = 1e-12) -> float:
+    """Per-slice amplitude scale: the max magnitude of the coil-combined
+    (SoS) image-domain reconstruction of `kspace_mnj`.
+
+    Raw MRI k-space -- fastMRI included -- is naturally tiny in magnitude
+    (mean SoS image magnitude on the order of 1e-5, confirmed by directly
+    inspecting the NYU knee dataset ODLS's own paper sources its data
+    from). Training on that scale unnormalized lets a network cheaply
+    minimize raw MSE by collapsing toward a near-zero output rather than
+    learning real reconstruction -- observed in practice on this project
+    (byte-identical, near-total reconstruction failure across every
+    checkpoint tested, all epochs, both before and after independently
+    fixing an unrelated runaway-threshold issue). Dividing k-space by
+    this scale before it reaches the network is the same technique used
+    by the published training code for that NYU dataset (the exact data
+    the paper's own knee experiments used): VLOGroup/mri-variationalnetwork's
+    mridata.py computes `norm = max(abs(zero-filled reconstruction))` and
+    divides k-space, the initial image, and the reference/target by that
+    one value. This adapts that same idea to a fully-sampled reference
+    (rather than a specific undersampled realization), so the resulting
+    scale doesn't depend on which random mask a given training sample
+    happens to draw.
+    """
+    img = np.fft.fftshift(
+        np.fft.ifft2(np.fft.ifftshift(kspace_mnj, axes=(0, 1)), axes=(0, 1), norm="ortho"),
+        axes=(0, 1),
+    )
+    sos = np.sqrt((np.abs(img) ** 2).sum(axis=-1))
+    scale = float(sos.max())
+    return scale if scale > eps else 1.0
+
+
 def load_fastmri_volume(path: str, n_virtual_coils: Optional[int] = 8,
                          crop_fe_to: Optional[int] = 224,
                          crop_pe_to: Optional[int] = 224) -> np.ndarray:
@@ -175,6 +207,8 @@ def load_fastmri_volume(path: str, n_virtual_coils: Optional[int] = 8,
         sl = resize_pe(sl, target_n=crop_pe_to)
         if n_virtual_coils is not None:
             sl = coil_compress(sl, n_virtual_coils)
+        scale = compute_normalization_scale(sl)
+        sl = (sl / scale).astype(np.complex64)
         processed_slices.append(sl)
 
     return np.stack(processed_slices, axis=0)
@@ -279,6 +313,9 @@ class FastMRICorpdDataset(Dataset):
         raw = resize_pe(raw, target_n=self.crop_pe_to)
         if self.n_virtual_coils is not None:
             raw = coil_compress(raw, self.n_virtual_coils)
+
+        scale = compute_normalization_scale(raw)
+        raw = (raw / scale).astype(np.complex64)
 
         hybrid = fe_ifft(raw)  # (M, N, J)
 

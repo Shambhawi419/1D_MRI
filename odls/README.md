@@ -169,6 +169,28 @@ rest of this codebase assumes:
   FOV. `crop_fe_to` / `crop_pe_to` are exposed as `--crop-fe-to` /
   `--crop-pe-to` on both `train.py` and `evaluate.py` -- keep them
   identical between training and evaluation of the same checkpoint.
+- **Amplitude normalization**: raw MRI k-space -- fastMRI included -- is
+  naturally tiny in magnitude (confirmed by directly inspecting real data
+  from the NYU knee dataset ODLS's own knee experiments were sourced
+  from: mean coil-combined image magnitude ~1e-5). Training on that scale
+  unnormalized lets the network cheaply minimize raw MSE by collapsing
+  toward a near-zero output rather than learning real reconstruction --
+  which is exactly what happened here: RLNE ~1.0 (near-total
+  reconstruction failure) on held-out test data, identically across every
+  checkpoint tested from epoch 1 through epoch 35, despite training loss
+  looking fine throughout. `compute_normalization_scale()` divides each
+  slice's k-space by the max magnitude of its own coil-combined image
+  reconstruction before anything else touches it, bringing every sample
+  to a consistent ~O(1) scale -- the same technique (max of the
+  zero-filled reconstruction) used by the published training code for
+  that exact NYU dataset (VLOGroup/mri-variationalnetwork's `mridata.py`),
+  adapted here to the fully-sampled reference so the scale doesn't depend
+  on which random undersampling mask a given sample draws. This is a
+  breaking change to the numeric scale of every value the network sees --
+  a checkpoint trained before this fix cannot be resumed afterward (see
+  `checkpoint_utils.py`'s docstring / the Colab notebook's `CHECKPOINT_DIR`
+  comment); training needs to restart from epoch 1 into a fresh
+  checkpoint directory.
 - **Memory, and why the GPU can otherwise sit idle**: fastMRI knee is far
   larger than the paper's original datasets, so `FastMRICorpdDataset`
   loads and processes slices lazily from disk rather than materializing
