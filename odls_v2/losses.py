@@ -27,9 +27,13 @@ class ODLSLoss(nn.Module):
         self.sym_weight = sym_weight
 
     def _to_image(self, k_space: torch.Tensor) -> torch.Tensor:
+        """Includes the closing fftshift a properly centered inverse FFT
+        requires -- see model.py's DeepSparseModule._ifft_pe docstring."""
         real, imag = k_space[:, : self.n_coils], k_space[:, self.n_coils :]
         complex_ks = torch.complex(real, imag)
-        img = torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho")
+        img = torch.fft.fftshift(
+            torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([img.real, img.imag], dim=1)
 
     def forward(self, e_ref: torch.Tensor, e_preds: List[torch.Tensor],

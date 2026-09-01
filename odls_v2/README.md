@@ -3,9 +3,21 @@
 This folder is a deliberate departure from the faithful replication in
 `../odls/`, exploring three architectural changes suggested as directions
 for improving on arXiv:2112.04721, rather than reproducing it. `../odls/`
-is left untouched as the working, validated baseline (RLNE ~14%, PSNR
-~27dB, SSIM ~95% on fastMRI CORPD_FBK after the normalization fix) --
-this folder is where new ideas get tried without risking that baseline.
+is left untouched as the working, validated baseline (RLNE ~11%, PSNR
+~30dB, SSIM ~97% on fastMRI CORPD_FBK, still improving with more
+training) -- this folder is where new ideas get tried without risking
+that baseline.
+
+**FFT-centering fix applied here too** (see `../odls/README.md`'s "A
+second breaking fix" section for the full story): `SharedDeepSparseModule`
+and `ODLSv2.reconstruct_image` were built directly on top of the
+baseline's code before a missing-fftshift centering bug was found there,
+so they inherited it. Both were fixed the same way and verified with the
+same point-source round-trip test. This was deliberate: fixing it only
+in one of `odls/` or `odls_v2/` would confound any future
+baseline-vs-v2 comparison (you'd be measuring "centered FFTs beat
+uncentered ones," not "the architectural changes help") -- fixing both
+keeps that comparison isolated to the actual intended differences.
 
 ## The three changes (see `model.py`'s module docstring for full detail)
 

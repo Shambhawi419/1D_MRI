@@ -32,8 +32,24 @@ from masks import MASK_FACTORIES
 
 def fe_ifft(k_space: np.ndarray) -> np.ndarray:
     """1D inverse FFT along the frequency-encoding axis (axis 0 of an
-    (M, N, J) k-space array), i.e. Psi*_FE in Eq. 1."""
-    return np.fft.ifft(np.fft.ifftshift(k_space, axes=0), axis=0, norm="ortho")
+    (M, N, J) k-space array), i.e. Psi*_FE in Eq. 1.
+
+    A properly *centered* inverse FFT needs three steps: ifftshift the
+    input, transform, then fftshift the output back. The previous version
+    of this function was missing the final fftshift, which leaves the
+    true image center at the array's corners instead of the middle --
+    visually indistinguishable from the image being cut into quarters and
+    rearranged. That bug did not corrupt training (the same incomplete
+    convention was applied consistently to both the reference and the
+    prediction everywhere it mattered, so the loss still validly compared
+    corresponding pixels), but it did mean every convolution in the
+    network was processing anatomy artificially split across the array
+    boundary instead of sitting centered and spatially coherent -- a
+    needlessly hard input shape for a local convolution kernel.
+    """
+    return np.fft.fftshift(
+        np.fft.ifft(np.fft.ifftshift(k_space, axes=0), axis=0, norm="ortho"), axes=0
+    )
 
 
 def pe_ifft(hybrid: np.ndarray, axis: int = 1) -> np.ndarray:
@@ -43,8 +59,13 @@ def pe_ifft(hybrid: np.ndarray, axis: int = 1) -> np.ndarray:
     `axis` defaults to 1, matching the (M, N, J) volume convention used
     throughout this module (M=frequency-encoding, N=phase-encoding,
     J=coils) -- NOT the last axis, which here is coils, not PE.
+
+    See fe_ifft's docstring for why this now includes the closing
+    fftshift a properly centered inverse FFT requires.
     """
-    return np.fft.ifft(np.fft.ifftshift(hybrid, axes=axis), axis=axis, norm="ortho")
+    return np.fft.fftshift(
+        np.fft.ifft(np.fft.ifftshift(hybrid, axes=axis), axis=axis, norm="ortho"), axes=axis
+    )
 
 
 def _to_real_imag_channels(x: np.ndarray) -> np.ndarray:

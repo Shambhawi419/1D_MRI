@@ -191,6 +191,41 @@ rest of this codebase assumes:
   `checkpoint_utils.py`'s docstring / the Colab notebook's `CHECKPOINT_DIR`
   comment); training needs to restart from epoch 1 into a fresh
   checkpoint directory.
+
+## A second breaking fix: FFT centering (fe_ifft / pe_ifft / _ifft_pe / _fft_pe / reconstruct_image / _to_image)
+
+A properly centered inverse FFT needs three steps: `ifftshift` the
+input, transform, then `fftshift` the output back. `data.py`'s
+`fe_ifft`/`pe_ifft`, `model.py`'s `DeepSparseModule._ifft_pe`/`_fft_pe`/
+`ODLS.reconstruct_image`, and `losses.py`'s `_to_image` were all missing
+the closing shift -- confirmed by direct visual inspection during Colab
+testing (both the ground-truth AND the reconstructed image showed the
+same "cut into quarters and rearranged" look, ruling out a reconstruction
+-quality issue -- both go through this same shared, buggy centering).
+
+This did **not** invalidate training: the same incomplete convention was
+applied consistently to the reference and the prediction everywhere it
+mattered (including inside the loss), so `L_err` still compared
+corresponding pixels correctly, and the RLNE/PSNR/SSIM numbers obtained
+before this fix are genuine, not fabricated by the bug. What it did cost:
+every convolution in the network was processing anatomy with its true
+center wrapped out to the array's corners instead of sitting centered
+and spatially coherent -- a needlessly awkward input shape for a local
+convolution kernel, likely making the learning task harder than
+necessary. Verified fixed with actual point-source round-trip tests (not
+just by inspection) in both NumPy (`fe_ifft`+`pe_ifft`) and PyTorch
+(`DeepSparseModule._ifft_pe`+`_fft_pe`): a bright pixel placed at the
+true center of a synthetic image now correctly returns to the center
+after the round trip.
+
+Like the normalization fix, this changes the actual spatial
+representation the network is trained on -- a checkpoint trained before
+this fix should not be resumed afterward; start fresh into a new
+checkpoint directory. `../odls_v2/` received the identical fix (its
+`SharedDeepSparseModule`/`ODLSv2` were built directly on top of this same
+code before the bug was found), so a baseline-vs-v2 comparison still
+isolates only the intended architectural differences, not this fix.
+
 - **Memory, and why the GPU can otherwise sit idle**: fastMRI knee is far
   larger than the paper's original datasets, so `FastMRICorpdDataset`
   loads and processes slices lazily from disk rather than materializing

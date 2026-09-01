@@ -241,16 +241,27 @@ class SharedDeepSparseModule(nn.Module):
 
     @staticmethod
     def _ifft_pe(k_space: torch.Tensor, n_coils: int) -> torch.Tensor:
+        """Properly centered inverse FFT: ifftshift-transform-fftshift.
+        See ../odls/model.py's DeepSparseModule._ifft_pe docstring for why
+        the closing fftshift matters (was missing in an earlier version of
+        this same function, inherited from the baseline before it was
+        independently fixed there)."""
         real, imag = k_space[:, :n_coils], k_space[:, n_coils:]
         complex_ks = torch.complex(real, imag)
-        img = torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho")
+        img = torch.fft.fftshift(
+            torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([img.real, img.imag], dim=1)
 
     @staticmethod
     def _fft_pe(image: torch.Tensor, n_coils: int) -> torch.Tensor:
+        """Forward FFT inverting _ifft_pe; needs the matching opening
+        ifftshift to correctly undo _ifft_pe's now-complete centering."""
         real, imag = image[:, :n_coils], image[:, n_coils:]
         complex_img = torch.complex(real, imag)
-        ks = torch.fft.fftshift(torch.fft.fft(complex_img, dim=-1, norm="ortho"), dim=-1)
+        ks = torch.fft.fftshift(
+            torch.fft.fft(torch.fft.ifftshift(complex_img, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([ks.real, ks.imag], dim=1)
 
     def _soft_threshold(self, x: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
@@ -345,7 +356,11 @@ class ODLSv2(nn.Module):
         return e_preds, sym_pairs
 
     def reconstruct_image(self, e_final: torch.Tensor) -> torch.Tensor:
+        """Includes the closing fftshift a properly centered inverse FFT
+        requires -- see SharedDeepSparseModule._ifft_pe's docstring."""
         real, imag = e_final[:, : self.n_coils], e_final[:, self.n_coils :]
         complex_ks = torch.complex(real, imag)
-        img = torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho")
+        img = torch.fft.fftshift(
+            torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([img.real, img.imag], dim=1)

@@ -121,17 +121,32 @@ class DeepSparseModule(nn.Module):
     @staticmethod
     def _ifft_pe(k_space: torch.Tensor, n_coils: int) -> torch.Tensor:
         """1D inverse FFT along the PE axis, applied per coil, on the
-        (real, imag) channel-stacked representation."""
+        (real, imag) channel-stacked representation.
+
+        A properly centered inverse FFT needs ifftshift-transform-fftshift;
+        this was previously missing the closing fftshift, leaving the true
+        image center wrapped out to the array's corners instead of sitting
+        in the middle -- a needlessly awkward, artificially-split input
+        shape for psi2/psi3's local convolutions to process. See
+        data.py's fe_ifft docstring for the full explanation.
+        """
         real, imag = k_space[:, :n_coils], k_space[:, n_coils:]
         complex_ks = torch.complex(real, imag)
-        img = torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho")
+        img = torch.fft.fftshift(
+            torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([img.real, img.imag], dim=1)
 
     @staticmethod
     def _fft_pe(image: torch.Tensor, n_coils: int) -> torch.Tensor:
+        """Forward FFT inverting _ifft_pe -- needs the matching opening
+        ifftshift (previously missing) so it correctly undoes _ifft_pe's
+        now-complete centering rather than only half of it."""
         real, imag = image[:, :n_coils], image[:, n_coils:]
         complex_img = torch.complex(real, imag)
-        ks = torch.fft.fftshift(torch.fft.fft(complex_img, dim=-1, norm="ortho"), dim=-1)
+        ks = torch.fft.fftshift(
+            torch.fft.fft(torch.fft.ifftshift(complex_img, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([ks.real, ks.imag], dim=1)
 
     def transform_and_reconstruct(self, d: torch.Tensor, n_coils: int):
@@ -238,8 +253,12 @@ class ODLS(nn.Module):
 
     def reconstruct_image(self, e_final: torch.Tensor) -> torch.Tensor:
         """Apply the final 1D PE inverse FFT to get the image-domain
-        reconstruction (S_hat = Psi*_PE(E_hat), Sec. II)."""
+        reconstruction (S_hat = Psi*_PE(E_hat), Sec. II). Includes the
+        closing fftshift a properly centered inverse FFT requires -- see
+        DeepSparseModule._ifft_pe's docstring."""
         real, imag = e_final[:, : self.n_coils], e_final[:, self.n_coils :]
         complex_ks = torch.complex(real, imag)
-        img = torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho")
+        img = torch.fft.fftshift(
+            torch.fft.ifft(torch.fft.ifftshift(complex_ks, dim=-1), dim=-1, norm="ortho"), dim=-1
+        )
         return torch.cat([img.real, img.imag], dim=1)
