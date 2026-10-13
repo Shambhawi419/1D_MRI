@@ -45,7 +45,9 @@ from losses import ODLSLoss
 from model import ODLSDynamic
 
 HISTORY_FIELDS = ["epoch", "train_loss", "train_err", "train_sym", "val_loss", "val_loss_smoothed", "lr",
-                  "epoch_minutes", "nonfinite_skipped", "lambda", "eta1", "eta2"]
+                  "epoch_minutes", "data_wait_pct", "nonfinite_skipped", "lambda", "eta1", "eta2"]
+EMPTY_PARTIAL = {"loss": 0.0, "err": 0.0, "sym": 0.0, "n": 0, "skipped": 0, "seconds": 0.0,
+                 "data_s": 0.0, "compute_s": 0.0}
 
 
 def optional_float(s: str) -> Optional[float]:
@@ -149,6 +151,9 @@ def main(argv=None):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     torch.manual_seed(args.seed)  # before the model is built: deterministic Xavier init
     device = args.device
+    # cuDNN autotunes the fastest conv algorithm per input shape; OCMR has a
+    # limited set of (ky, frames) sizes, so after the first epoch all are tuned.
+    torch.backends.cudnn.benchmark = device.startswith("cuda")
     amp = bool(args.amp and device.startswith("cuda"))
     dev_type = "cuda" if device.startswith("cuda") else "cpu"
 
@@ -174,7 +179,7 @@ def main(argv=None):
 
     # ------------------------------------------------------------ state ----
     epoch, batch_in_epoch, global_step = 1, 0, 0
-    partial = {"loss": 0.0, "err": 0.0, "sym": 0.0, "n": 0, "skipped": 0, "seconds": 0.0}
+    partial = dict(EMPTY_PARTIAL)
     history: List[Dict] = []
     val_hist: List[float] = []
     best_smoothed = math.inf
@@ -194,12 +199,12 @@ def main(argv=None):
         scaler.load_state_dict(state["scaler_state_dict"])
         restore_rng_state(state["rng"])
         epoch, batch_in_epoch, global_step = state["epoch"], state["batch_in_epoch"], state["global_step"]
-        partial, history = state["partial"], state["history"]
+        partial, history = {**EMPTY_PARTIAL, **state["partial"]}, state["history"]
         val_hist, best_smoothed = state["val_hist"], state["best_smoothed"]
         if state["args"]["batch_size"] != args.batch_size and batch_in_epoch:
             print("batch size changed: restarting the interrupted epoch from its first batch")
             batch_in_epoch = 0
-            partial = {"loss": 0.0, "err": 0.0, "sym": 0.0, "n": 0, "skipped": 0, "seconds": 0.0}
+            partial = dict(EMPTY_PARTIAL)
         log_line(args.checkpoint_dir, f"RESUME epoch {epoch} batch {batch_in_epoch} (step {global_step})")
     else:
         if args.init_checkpoint:
@@ -233,7 +238,10 @@ def main(argv=None):
         epoch_t0 = time.time()
         bar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}", initial=batch_in_epoch,
                    total=batch_in_epoch + len(train_sampler))
+        t_ready = time.time()
         for batch in bar:
+            t_got = time.time()
+            partial["data_s"] += t_got - t_ready      # time the GPU waited for the DataLoader
             z, e_ref, mask = (batch[k].to(device, non_blocking=True) for k in ("z", "e_ref", "mask"))
             optimizer.zero_grad(set_to_none=True)
             try:
@@ -270,7 +278,10 @@ def main(argv=None):
             batch_in_epoch += 1
             global_step += 1
             steps_this_session += 1
-            bar.set_postfix(loss=f"{partial['loss'] / max(partial['n'], 1):.5f}")
+            t_ready = time.time()                     # loss.item() above already synced the GPU
+            partial["compute_s"] += t_ready - t_got
+            wait = 100 * partial["data_s"] / max(partial["data_s"] + partial["compute_s"], 1e-9)
+            bar.set_postfix(loss=f"{partial['loss'] / max(partial['n'], 1):.5f}", data_wait=f"{wait:.0f}%")
 
             if args.stop_after_steps and steps_this_session >= args.stop_after_steps:
                 print("simulated crash (no save)")
@@ -298,6 +309,7 @@ def main(argv=None):
             "epoch": epoch, "train_loss": partial["loss"] / n, "train_err": partial["err"] / n,
             "train_sym": partial["sym"] / n, "val_loss": val_loss, "val_loss_smoothed": smoothed,
             "lr": scheduler.get_last_lr()[0], "epoch_minutes": round(partial["seconds"] / 60, 2),
+            "data_wait_pct": round(100 * partial["data_s"] / max(partial["data_s"] + partial["compute_s"], 1e-9), 1),
             "nonfinite_skipped": partial["skipped"],
             **{k: json.dumps([round(v, 6) for v in vals]) for k, vals in scalars.items()},
         })
@@ -310,7 +322,7 @@ def main(argv=None):
         scheduler.step()
         epoch += 1
         batch_in_epoch = 0
-        partial = {"loss": 0.0, "err": 0.0, "sym": 0.0, "n": 0, "skipped": 0, "seconds": 0.0}
+        partial = dict(EMPTY_PARTIAL)
         checkpoint_now("epoch end")
         write_history(args.checkpoint_dir, history)
 
