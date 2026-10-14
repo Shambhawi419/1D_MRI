@@ -29,6 +29,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -185,6 +186,16 @@ def main(argv=None):
     best_smoothed = math.inf
 
     state = None if args.no_resume else load_latest(args.checkpoint_dir, device)
+    if state is not None and set(state["model_state_dict"]) != set(model.state_dict()):
+        # Run folder from an older model.py: move it aside and start fresh instead of stopping.
+        archive = os.path.join(args.checkpoint_dir, f"incompatible_{datetime.now():%Y%m%d_%H%M%S}")
+        os.makedirs(archive)
+        for name in os.listdir(args.checkpoint_dir):
+            if not name.startswith("incompatible_"):
+                shutil.move(os.path.join(args.checkpoint_dir, name), os.path.join(archive, name))
+        print(f"NOTE: {args.checkpoint_dir} held a run from an older version of model.py; moved it to "
+              f"{archive} and starting a fresh run.")
+        state = None
     if state is not None:
         if state["model_config"] != model_config:
             sys.exit(f"ERROR: {args.checkpoint_dir} holds a run with model config\n  {state['model_config']}\n"
@@ -193,10 +204,6 @@ def main(argv=None):
         if float(state["args"]["af"]) != args.af:
             sys.exit(f"ERROR: run was trained at AF={state['args']['af']}, this command says --af {args.af}. "
                      f"Use a new --checkpoint-dir with --init-checkpoint to fine-tune at another AF.")
-        if set(state["model_state_dict"]) != set(model.state_dict()):
-            sys.exit(f"ERROR: {args.checkpoint_dir} was created by an older version of model.py (its "
-                     f"parameters differ from the current code). Delete that run folder or use a new "
-                     f"--checkpoint-dir / RUN_NAME to start a fresh run.")
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])

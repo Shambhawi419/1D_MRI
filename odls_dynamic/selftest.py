@@ -171,6 +171,23 @@ def test_fallback_and_guard(data_dir, run_dir):
     ok("resume with a different architecture is refused with a clear message")
 
 
+def test_outdated_run_archived(data_dir, tmp):
+    run_dir = os.path.join(tmp, "runOld")
+    common = ["--data-dir", data_dir, "--checkpoint-dir", run_dir, "--epochs", "1", "--batch-size", "6",
+              "--n-phases", "2", "--width", "8", "--num-workers", "0", "--device", "cpu"]
+    run(common)
+    path = os.path.join(run_dir, LATEST)
+    state = torch.load(path, weights_only=False)
+    sd = state["model_state_dict"]
+    sd["phases.0.ds.threshold"] = sd.pop("phases.0.ds.log_threshold")   # mimic the old model.py
+    torch.save(state, path)
+    r = run(common)
+    assert "starting a fresh run" in r.stdout, r.stdout[-1500:]
+    assert any(n.startswith("incompatible_") for n in os.listdir(run_dir))
+    assert os.path.exists(os.path.join(run_dir, "final.pt"))
+    ok("run folder from an older model.py is moved aside automatically and a fresh run starts")
+
+
 def test_evaluate(data_dir, run_dir):
     model, ckpt = build_model_from_checkpoint(os.path.join(run_dir, "best.pt"))
     assert model.config["width"] == 8 and ckpt["args"]["af"] == 4.0
@@ -194,6 +211,7 @@ def main():
         run_a, run_b = test_resume_exact(data_dir, tmp)
         test_evaluate(data_dir, run_a)
         test_fallback_and_guard(data_dir, run_b)
+        test_outdated_run_archived(data_dir, tmp)
         print("ALL SELF-TESTS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
