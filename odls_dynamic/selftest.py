@@ -13,6 +13,7 @@ architecture, and evaluate.py end to end.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import shutil
 import subprocess
@@ -151,7 +152,10 @@ def test_resume_exact(data_dir, tmp):
     assert all(torch.equal(wa[k], wb[k]) for k in wa), "resumed run diverged"
     hist = list(csv.DictReader(open(os.path.join(b, "history.csv"))))
     assert [h["epoch"] for h in hist] == ["1", "2"]
-    ok("crash after step 5 + re-run == uninterrupted run, bit for bit; history has no duplicates")
+    lams = [v for h in hist for v in json.loads(h["lambda"])]
+    assert all(v > 0 for v in lams), f"a soft-threshold died at 0: {lams}"
+    ok("crash after step 5 + re-run == uninterrupted run, bit for bit; history has no duplicates; "
+       "every soft-threshold stays > 0")
     return a, b
 
 

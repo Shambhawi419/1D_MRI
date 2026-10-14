@@ -53,6 +53,7 @@ Options (all stored in the checkpoint's model config):
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -128,13 +129,18 @@ class DeepSparseModule(nn.Module):
         self.ds_residual = ds_residual
         self.psi2 = conv_stack(channels, width, 3, width, kernel_t)  # forward transform -> width-ch domain
         self.psi3 = conv_stack(width, channels, 3, width, kernel_t)  # inverse transform
-        self.threshold = nn.Parameter(torch.tensor(0.001))
+        # lambda = exp(log_threshold), init 0.001 (paper). Stored in log space so
+        # it is always > 0 and its gradient never vanishes: a plain parameter
+        # clamped at 0 was pushed negative within the first steps of a real
+        # OCMR run, got stuck at exactly 0 (clamp has zero gradient), and that
+        # turns the residual DS into the identity for the rest of training.
+        self.log_threshold = nn.Parameter(torch.tensor(math.log(0.001)))
         self.sparse_domain = sparse_domain
         self.max_threshold = max_threshold
 
     def effective_threshold(self) -> torch.Tensor:
-        # lambda < 0 would turn shrinkage into amplification.
-        return self.threshold.clamp(min=0.0, max=self.max_threshold)
+        lam = self.log_threshold.exp()
+        return lam if self.max_threshold is None else lam.clamp(max=self.max_threshold)
 
     def _to_sparse_domain(self, d: torch.Tensor) -> torch.Tensor:
         x = ifftc(d, PE_DIM)                 # hybrid k-space -> image (y, t)
@@ -223,4 +229,5 @@ class ODLSDynamic(nn.Module):
     @torch.no_grad()
     def clamp_thresholds_(self) -> None:
         for p in self.phases:
-            p.ds.threshold.clamp_(min=0.0, max=p.ds.max_threshold)
+            if p.ds.max_threshold is not None:
+                p.ds.log_threshold.clamp_(max=math.log(p.ds.max_threshold))

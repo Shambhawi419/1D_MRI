@@ -193,6 +193,10 @@ def main(argv=None):
         if float(state["args"]["af"]) != args.af:
             sys.exit(f"ERROR: run was trained at AF={state['args']['af']}, this command says --af {args.af}. "
                      f"Use a new --checkpoint-dir with --init-checkpoint to fine-tune at another AF.")
+        if set(state["model_state_dict"]) != set(model.state_dict()):
+            sys.exit(f"ERROR: {args.checkpoint_dir} was created by an older version of model.py (its "
+                     f"parameters differ from the current code). Delete that run folder or use a new "
+                     f"--checkpoint-dir / RUN_NAME to start a fresh run.")
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
