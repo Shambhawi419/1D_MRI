@@ -39,8 +39,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from checkpoint_utils import (BEST, FINAL, atomic_save, load_latest, load_model_weights, restore_rng_state,
-                              rng_state, save_latest, weights_checkpoint)
+from checkpoint_utils import (BEST, FINAL, CheckpointUnreadable, atomic_save, load_latest, load_model_weights,
+                              restore_rng_state, rng_state, save_latest, weights_checkpoint)
 from data import OCMRRowDataset, SliceBatchSampler, memory_balanced_batch_sizes
 from losses import ODLSLoss
 from model import ODLSDynamic
@@ -95,7 +95,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Start a NEW run from these weights (fresh optimizer, epoch 1). Ignored when "
                         "--checkpoint-dir already holds a run to resume.")
     p.add_argument("--no-resume", action="store_true",
-                   help="Ignore an existing run in --checkpoint-dir (it will be overwritten).")
+                   help="Start over even if --checkpoint-dir holds a run (its files are moved to "
+                        "previous_<time>/ inside the folder, not deleted).")
     # data loading
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--max-train-slices", type=int, default=None, help="Debug: use only the first N slices.")
@@ -124,6 +125,24 @@ def write_history(checkpoint_dir: str, history: List[Dict]) -> None:
         w.writeheader()
         w.writerows(history)
     os.replace(path + ".tmp", path)
+
+
+ARCHIVE_PREFIXES = ("previous_", "incompatible_")
+
+
+def archive_run_files(checkpoint_dir: str, prefix: str) -> Optional[str]:
+    """Moves everything a previous run left in checkpoint_dir (except earlier
+    archives) into <checkpoint_dir>/<prefix><timestamp>/ so a fresh run can
+    never overwrite another run's best.pt / history. Returns the archive path,
+    or None if there was nothing to move."""
+    names = [n for n in os.listdir(checkpoint_dir) if not n.startswith(ARCHIVE_PREFIXES)]
+    if not names:
+        return None
+    archive = os.path.join(checkpoint_dir, f"{prefix}{datetime.now():%Y%m%d_%H%M%S}")
+    os.makedirs(archive)
+    for name in names:
+        shutil.move(os.path.join(checkpoint_dir, name), os.path.join(archive, name))
+    return archive
 
 
 def make_loader(dataset, sampler, args):
@@ -185,14 +204,20 @@ def main(argv=None):
     val_hist: List[float] = []
     best_smoothed = math.inf
 
-    state = None if args.no_resume else load_latest(args.checkpoint_dir, device)
+    try:
+        state = None if args.no_resume else load_latest(args.checkpoint_dir, device)
+    except CheckpointUnreadable as exc:
+        best = os.path.join(args.checkpoint_dir, BEST)
+        sys.exit(f"ERROR: {exc} (most likely a Colab session ended while Google Drive was still uploading "
+                 f"them). Nothing was changed{' -- best.pt is untouched' if os.path.exists(best) else ''}.\n"
+                 f"Options:\n"
+                 f"  * continue from the best model as a new run: use a new --checkpoint-dir / RUN_NAME and add\n"
+                 f"      --init-checkpoint {best}\n"
+                 f"  * start this run over: add --no-resume (the old files are moved to previous_<time>/, "
+                 f"not deleted)")
     if state is not None and set(state["model_state_dict"]) != set(model.state_dict()):
         # Run folder from an older model.py: move it aside and start fresh instead of stopping.
-        archive = os.path.join(args.checkpoint_dir, f"incompatible_{datetime.now():%Y%m%d_%H%M%S}")
-        os.makedirs(archive)
-        for name in os.listdir(args.checkpoint_dir):
-            if not name.startswith("incompatible_"):
-                shutil.move(os.path.join(args.checkpoint_dir, name), os.path.join(archive, name))
+        archive = archive_run_files(args.checkpoint_dir, "incompatible_")
         print(f"NOTE: {args.checkpoint_dir} held a run from an older version of model.py; moved it to "
               f"{archive} and starting a fresh run.")
         state = None
@@ -218,8 +243,12 @@ def main(argv=None):
             partial = dict(EMPTY_PARTIAL)
         log_line(args.checkpoint_dir, f"RESUME epoch {epoch} batch {batch_in_epoch} (step {global_step})")
     else:
-        if args.init_checkpoint:
+        if args.init_checkpoint:  # load before archiving: it may live in this same folder
             load_model_weights(model, args.init_checkpoint, device)
+        archive = archive_run_files(args.checkpoint_dir, "previous_")
+        if archive:
+            print(f"NOTE: moved files of an earlier run in {args.checkpoint_dir} to {archive} "
+                  f"so this new run cannot overwrite them.")
         log_line(args.checkpoint_dir, f"START new run (init={args.init_checkpoint}) | model {model_config} | "
                                       f"{sum(p.numel() for p in model.parameters())} params | "
                                       f"{len(train_set)} train rows / {len(train_set.rows)} slices, "
@@ -227,7 +256,7 @@ def main(argv=None):
         with open(os.path.join(args.checkpoint_dir, "run_config.json"), "w") as f:
             json.dump({"args": vars(args), "model_config": model_config}, f, indent=2)
 
-    def checkpoint_now(reason: str):
+    def checkpoint_now(reason: str, snapshot: bool = False):
         save_latest({
             "format_version": 1, "model_config": model_config, "args": vars(args),
             "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
@@ -235,7 +264,7 @@ def main(argv=None):
             "rng": rng_state(), "epoch": epoch, "batch_in_epoch": batch_in_epoch,
             "global_step": global_step, "partial": partial, "history": history,
             "val_hist": val_hist, "best_smoothed": best_smoothed, "saved_reason": reason,
-        }, args.checkpoint_dir)
+        }, args.checkpoint_dir, snapshot=snapshot)
 
     if epoch > args.epochs:
         print(f"run already finished {args.epochs} epochs; raise --epochs to continue training.")
@@ -334,7 +363,7 @@ def main(argv=None):
         epoch += 1
         batch_in_epoch = 0
         partial = dict(EMPTY_PARTIAL)
-        checkpoint_now("epoch end")
+        checkpoint_now("epoch end", snapshot=True)
         write_history(args.checkpoint_dir, history)
 
     atomic_save(weights_checkpoint(model, epoch=args.epochs, args=vars(args)),

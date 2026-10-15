@@ -188,6 +188,32 @@ def test_outdated_run_archived(data_dir, tmp):
     ok("run folder from an older model.py is moved aside automatically and a fresh run starts")
 
 
+def test_all_corrupted_is_safe(data_dir, tmp):
+    """The Colab failure: every state file truncated. Must refuse, keep best.pt."""
+    import hashlib
+    run_dir = os.path.join(tmp, "runCorrupt")
+    common = ["--data-dir", data_dir, "--checkpoint-dir", run_dir, "--epochs", "4", "--batch-size", "6",
+              "--n-phases", "2", "--width", "8", "--num-workers", "0", "--device", "cpu"]
+    run(common)
+    snaps = os.listdir(os.path.join(run_dir, "snapshots"))
+    assert len(snaps) == 3, snaps                                    # pruned to the newest 3
+    digest = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+    best_before = digest(os.path.join(run_dir, "best.pt"))
+    for root, _, files in os.walk(run_dir):
+        for f in files:
+            if f.startswith(("latest", "epoch_")):
+                with open(os.path.join(root, f), "r+b") as fh:
+                    fh.truncate(100)                                 # simulate interrupted uploads
+    r = run(common + ["--epochs", "5"], check=False)
+    assert r.returncode != 0 and "could be read" in (r.stdout + r.stderr), r.stdout[-800:] + r.stderr[-800:]
+    assert digest(os.path.join(run_dir, "best.pt")) == best_before
+    ok("all checkpoints corrupted -> refuses to start over, best.pt byte-identical")
+    r = run(common + ["--epochs", "1", "--no-resume"])
+    prev = [n for n in os.listdir(run_dir) if n.startswith("previous_")]
+    assert prev and digest(os.path.join(run_dir, prev[0], "best.pt")) == best_before
+    ok("--no-resume moves the old run to previous_<time>/ instead of overwriting it")
+
+
 def test_evaluate(data_dir, run_dir):
     model, ckpt = build_model_from_checkpoint(os.path.join(run_dir, "best.pt"))
     assert model.config["width"] == 8 and ckpt["args"]["af"] == 4.0
@@ -212,6 +238,7 @@ def main():
         test_evaluate(data_dir, run_a)
         test_fallback_and_guard(data_dir, run_b)
         test_outdated_run_archived(data_dir, tmp)
+        test_all_corrupted_is_safe(data_dir, tmp)
         print("ALL SELF-TESTS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
