@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -133,8 +133,13 @@ def main(argv=None):
             np.savez_compressed(os.path.join(out_dir, f"{row['name']}.npz"), ref=ref_mag.astype(np.float16),
                                 mask=mask.astype(np.uint8), **{m: v.astype(np.float16) for m, v in mags.items()})
 
+    kernel_t = (ckpt.get("model_config") or {}).get("kernel_t")
+    # The model's results are stored under the key "odls_dynamic" for both variants (kept for
+    # compatibility with existing results.json / .npz files); "model_label" says which it is.
+    model_label = None if model is None else ("dynamic ODLS" if kernel_t and kernel_t > 1 else "frame-by-frame ODLS")
     results = {
         "checkpoint": args.checkpoint, "checkpoint_epoch": ckpt.get("epoch"), "model_config": ckpt.get("model_config"),
+        "model_label": model_label,
         "split": args.split, "af_requested": af, "af_measured_mean": float(np.mean(afs)), "mask_seed": args.seed,
         "n_slices": len(rows), "n_frames": len(allf["zero_filled"]["RLNE"]),
         "overall": {m: summarise(allf[m]) for m in methods},
@@ -148,7 +153,8 @@ def main(argv=None):
           f"(measured {results['af_measured_mean']:.2f})")
     for m in methods:
         o = results["overall"][m]
-        print(f"  {m:13s} RLNE {o['RLNE_mean'] * 100:6.2f} +/- {o['RLNE_std'] * 100:5.2f} (x1e-2) | "
+        name = model_label if m == "odls_dynamic" else "zero-filled"
+        print(f"  {name:20s} RLNE {o['RLNE_mean'] * 100:6.2f} +/- {o['RLNE_std'] * 100:5.2f} (x1e-2) | "
               f"PSNR {o['PSNR_mean']:6.2f} +/- {o['PSNR_std']:5.2f} dB | "
               f"SSIM {o['SSIM_mean'] * 100:6.2f} +/- {o['SSIM_std'] * 100:5.2f} (x1e-2)")
     print(f"saved {os.path.join(out_dir, 'results.json')}")

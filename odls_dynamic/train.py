@@ -195,7 +195,10 @@ def main(argv=None):
     criterion = ODLSLoss(sym_weight=args.sym_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    except (AttributeError, TypeError):  # torch < 2.3
+        scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # ------------------------------------------------------------ state ----
     epoch, batch_in_epoch, global_step = 1, 0, 0
@@ -267,7 +270,11 @@ def main(argv=None):
         }, args.checkpoint_dir, snapshot=snapshot)
 
     if epoch > args.epochs:
-        print(f"run already finished {args.epochs} epochs; raise --epochs to continue training.")
+        final = os.path.join(args.checkpoint_dir, FINAL)
+        if not os.path.exists(final):  # the session ended between the last epoch and writing final.pt
+            atomic_save(weights_checkpoint(model, epoch=epoch - 1, args=vars(args)), final)
+            log_line(args.checkpoint_dir, f"FINISHED {epoch - 1} epochs (final.pt written on re-run)")
+        print(f"run already finished {epoch - 1} epochs; raise --epochs to continue training.")
         return
 
     session_start = time.time()

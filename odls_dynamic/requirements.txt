@@ -1,0 +1,7 @@
+# odls_dynamic -- Python >= 3.9. Colab already has all of these.
+numpy>=1.23
+torch>=2.0          # mixed precision uses torch.amp (>= 2.3) with a fallback for older versions
+h5py>=3.7           # OCMR .h5 files (ocmr_io.py)
+tqdm
+requests            # preprocess_ocmr.py: streaming downloads from OCMR's S3 bucket
+# Only for the notebook's plots / tables: matplotlib, pandas

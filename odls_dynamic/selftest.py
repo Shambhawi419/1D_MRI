@@ -214,6 +214,18 @@ def test_all_corrupted_is_safe(data_dir, tmp):
     ok("--no-resume moves the old run to previous_<time>/ instead of overwriting it")
 
 
+def test_final_written_on_rerun(data_dir, tmp):
+    """Session died after the last epoch but before final.pt: a re-run must write it."""
+    run_dir = os.path.join(tmp, "runFinal")
+    common = ["--data-dir", data_dir, "--checkpoint-dir", run_dir, "--epochs", "1", "--batch-size", "6",
+              "--n-phases", "2", "--width", "8", "--num-workers", "0", "--device", "cpu"]
+    run(common)
+    os.remove(os.path.join(run_dir, "final.pt"))
+    r = run(common)
+    assert os.path.exists(os.path.join(run_dir, "final.pt")) and "already finished" in r.stdout, r.stdout[-800:]
+    ok("finished run missing final.pt -> re-running the same command writes it")
+
+
 def test_evaluate(data_dir, run_dir):
     model, ckpt = build_model_from_checkpoint(os.path.join(run_dir, "best.pt"))
     assert model.config["width"] == 8 and ckpt["args"]["af"] == 4.0
@@ -239,6 +251,7 @@ def main():
         test_fallback_and_guard(data_dir, run_b)
         test_outdated_run_archived(data_dir, tmp)
         test_all_corrupted_is_safe(data_dir, tmp)
+        test_final_written_on_rerun(data_dir, tmp)
         print("ALL SELF-TESTS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

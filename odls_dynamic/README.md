@@ -4,7 +4,21 @@ ODLS (Wang et al., "One-dimensional Deep Low-rank and Sparse Network for
 Accelerated MRI", arXiv:2112.04721) extended to dynamic MRI, trained on the
 OCMR dataset. `../odls/` (the static fastMRI replication) is untouched.
 
-Run it with `../colab/ODLS_Dynamic_OCMR_Colab.ipynb` (free Colab T4 is enough).
+Run it with `../colab/ODLS_Dynamic_OCMR_Colab.ipynb` (free Colab T4 is enough);
+`../colab/ODLS_Dynamic_AF8_Colab.ipynb` runs both AF 8 experiments back to back.
+
+## Setup (read first)
+
+- **Run every script from inside this folder** (`cd odls_dynamic && python train.py ...`).
+  The modules import each other by plain name (`from model import ODLSDynamic`), so
+  `python odls_dynamic/train.py` from the repo root, or `import odls_dynamic.train`, fails
+  with `ModuleNotFoundError`.
+- Dependencies: `pip install -r requirements.txt` (Python >= 3.9; Colab has everything).
+- **Run `python selftest.py` after any change** (CPU, about 1-2 min, synthetic data, no
+  OCMR needed). It checks masks, FFT centring, gradients, bit-exact crash-and-resume,
+  corrupted-checkpoint handling and evaluation end to end.
+- Data: `preprocess_ocmr.py --out-dir <dir>` (streams OCMR, see below). `train.py` and
+  `evaluate.py` take `--data-dir <dir>` (ideally a local-disk copy of it).
 
 ## Design
 
@@ -25,6 +39,10 @@ Run it with `../colab/ODLS_Dynamic_OCMR_Colab.ipynb` (free Colab T4 is enough).
     output.
   - `--no-ds-residual` is the literal Eq. 14. See `model.py` for the
     measured difference.
+- **Threshold parameter**: each phase stores `log(lambda)` (init `log(0.001)`), so
+  lambda stays positive with a non-vanishing gradient. A plain clamped parameter
+  hit exactly 0 in the first steps of a real run and stayed there, which turns
+  the residual sparse module into the identity.
 - **k-t masks**: variable-density random Cartesian lines, different in every
   frame, centre lines always sampled, exact AF per frame.
 
@@ -70,6 +88,7 @@ A run folder holds the following files:
 |---|---|
 | `latest.pt` | Full state: model, optimizer, scheduler, AMP scaler, all RNGs, epoch and batch position, history |
 | `latest_prev.pt` | The previous `latest.pt`, as a fallback |
+| `snapshots/epoch_XXXX.pt` | Full state at the last 3 epoch ends: further fallbacks |
 | `best.pt` | Best 5-epoch-average validation loss |
 | `final.pt` | Weights at the end of training |
 | `history.csv` | Per-epoch log |
@@ -77,8 +96,22 @@ A run folder holds the following files:
 | `run_config.json` | Training arguments and model config |
 | `eval_*/results.json` | Evaluation results |
 
-- **Saved every 200 steps and at the end of every epoch.** Writes are atomic
-  (temp file, then rename), so a disconnect can't corrupt a checkpoint.
+- **Saved every 200 steps and at the end of every epoch.** Each write goes to a
+  temp file, is fsync'ed, then renamed into place.
+- **Google Drive caveat**: Colab uploads Drive files in the background, so a
+  runtime killed abruptly (e.g. GPU quota) can lose files written in its last
+  minutes, or leave them truncated. The notebooks therefore call
+  `drive.flush_and_unmount()` when training stops, and stop training cleanly
+  every 3 h (`--time-limit-min 180`).
+- **Fallback order on resume**: `latest.pt`, `latest.pt.tmp`, `latest_prev.pt`,
+  then snapshots, newest first. If state files exist but **none** can be read,
+  `train.py` stops and changes nothing (it never starts over on top of a run's
+  `best.pt`). `--no-resume` starts over and moves the old files to
+  `previous_<time>/`. A fresh start in a non-empty folder always archives the
+  old files first. A folder from an older `model.py` (different parameters) is
+  moved to `incompatible_<time>/` automatically.
+- **Finished runs**: re-running a finished run writes `final.pt` if it's missing
+  (session died just after the last epoch). Raising `--epochs` continues the run.
 - **Resume**: re-run the same command. It continues from the exact batch,
   bit-for-bit identical to an uninterrupted run (tested in `selftest.py`).
   It refuses to resume with a different architecture or AF.
@@ -128,3 +161,10 @@ A run folder holds the following files:
   and coil compression, which assumes AF <= about 12.
 - The OCMR CSV doesn't identify subjects, so the split is by file. An LAX
   and an SAX file could come from the same volunteer.
+- `results.json` stores the trained model's metrics under the key
+  `odls_dynamic` for **both** variants (kept for compatibility). Its
+  `model_label` and `model_config.kernel_t` say whether it is the dynamic
+  (`kernel_t` 3) or the frame-by-frame (`kernel_t` 1) model.
+- Never train the same run folder from two Colab sessions at once (e.g. two
+  accounts sharing one Drive folder): both would write the same checkpoint
+  files.
