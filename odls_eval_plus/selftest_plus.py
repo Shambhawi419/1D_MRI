@@ -110,7 +110,7 @@ def test_pipeline(data_dir, tmp):
 
     # 4. L+S tuning + evaluation, two (untrained) networks, then the comparison
     run(HERE, "tune_lps.py", ["--data-dir", data_dir, "--out-root", out, "--af", "4", "--device", "cpu",
-                              "--lam-l", "0.01", "0.02", "--lam-s", "0.01", "0.02", "--n-iter", "20"])
+                              "--lam-l", "0.01", "0.02", "--lam-s", "0.01", "0.02", "--n-iter", "20", "--max-widen", "1"])
     run(HERE, "evaluate_plus.py", common + ["--method", "lps", "--af", "4", "--split", "train",
                                             "--lps-params", os.path.join(out, "lps_params_af4.json")])
     for kt in (3, 1):

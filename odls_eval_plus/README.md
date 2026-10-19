@@ -94,10 +94,12 @@ Nothing from the fully-sampled reference is used.
 
 **Settings.** τ_L = `lam_l` × (largest singular value), and τ_S = `lam_s` ×
 (largest temporal-spectrum magnitude), so the same `lam_l` and `lam_s` work for
-every slice. `tune_lps.py` tries a 5×5 grid on the validation slices, keeps the
-pair with the lowest RLNE, and warns if the best value sits on the edge of the
-grid. Tuning on validation, not on test, is the same rule the networks follow
-when `best.pt` is chosen.
+every slice. `tune_lps.py` tries a grid of values on the validation slices and
+keeps the pair with the lowest RLNE. If that pair sits on the edge of the grid,
+the optimum may lie outside it, so the grid is extended in that direction
+(halving or doubling the extreme value) and the new pairs are tried, up to 3
+times, until the best pair is inside. Tuning on validation, not on test, is the
+same rule the networks follow when `best.pt` is chosen.
 
 ## 3. Outputs
 
