@@ -49,6 +49,12 @@ Options (all stored in the checkpoint's model config):
                 sparsity domain of k-t methods).
   max_threshold optional cap on lambda (None = no cap, as in the paper);
                 train.py logs every phase's lambda so a blow-up is visible.
+  conv_mode     "joint" (default, single (3,kernel_t) conv), "separable"
+                ((3,1) along ky then (1,kernel_t) along t -- the paper's
+                suggested future direction for dynamic MRI).
+  use_se        False (default) or True: adds a squeeze-and-excitation
+                channel-attention block after each conv stack (adaptive
+                feature weighting per input, as in the paper's direction 1).
 """
 
 from __future__ import annotations
@@ -77,7 +83,51 @@ class KTConv(nn.Module):
         return self.conv(x)
 
 
-def conv_stack(c_in: int, c_out: int, n_layers: int, width: int, kernel_t: int) -> nn.Sequential:
+class SeparableKTConv(nn.Module):
+    """Separable 1D convolutions: (kernel_n, 1) along ky then (1, kernel_t)
+    along t, with circular padding on the temporal axis. 33% fewer parameters
+    per layer than the joint (kernel_n, kernel_t) kernel."""
+
+    def __init__(self, c_in: int, c_out: int, kernel_n: int = 3, kernel_t: int = 3):
+        super().__init__()
+        self.pad_t = kernel_t // 2
+        self.conv_n = nn.Conv2d(c_in, c_out, (kernel_n, 1), padding=(kernel_n // 2, 0))
+        self.conv_t = nn.Conv2d(c_out, c_out, (1, kernel_t), padding=(0, 0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv_n(x)
+        if self.pad_t:
+            x = F.pad(x, (self.pad_t, self.pad_t, 0, 0), mode="circular")
+        return self.conv_t(x)
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation: adaptive per-channel weighting."""
+
+    def __init__(self, channels: int, reduction: int = 6):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = x.mean(dim=(2, 3))          # (B, C) global avg pool
+        w = self.fc(w).unsqueeze(-1).unsqueeze(-1)
+        return x * w
+
+
+def _kt_conv(c_in: int, c_out: int, kernel_n: int, kernel_t: int, conv_mode: str) -> nn.Module:
+    if conv_mode == "separable":
+        return SeparableKTConv(c_in, c_out, kernel_n, kernel_t)
+    return KTConv(c_in, c_out, kernel_n, kernel_t)
+
+
+def conv_stack(c_in: int, c_out: int, n_layers: int, width: int, kernel_t: int,
+               conv_mode: str = "joint", use_se: bool = False) -> nn.Sequential:
     """n_layers convs of `width` filters; BN + ReLU after every layer but the
     last (whose output is the signed signal / transform coefficients)."""
     layers: List[nn.Module] = []
@@ -85,10 +135,12 @@ def conv_stack(c_in: int, c_out: int, n_layers: int, width: int, kernel_t: int) 
     for i in range(n_layers):
         last = i == n_layers - 1
         out = c_out if last else width
-        layers.append(KTConv(c, out, 3, kernel_t))
+        layers.append(_kt_conv(c, out, 3, kernel_t, conv_mode))
         if not last:
             layers += [nn.BatchNorm2d(out), nn.ReLU(inplace=True)]
         c = out
+    if use_se:
+        layers.append(SEBlock(c_out))
     return nn.Sequential(*layers)
 
 
@@ -98,9 +150,10 @@ class DeepLowRankModule(nn.Module):
     ky lines (the Hankel/annihilation-filter structure) and neighbouring
     frames."""
 
-    def __init__(self, channels: int, width: int, kernel_t: int):
+    def __init__(self, channels: int, width: int, kernel_t: int,
+                 conv_mode: str = "joint", use_se: bool = False):
         super().__init__()
-        self.D1 = conv_stack(channels, channels, 6, width, kernel_t)
+        self.D1 = conv_stack(channels, channels, 6, width, kernel_t, conv_mode, use_se)
         self.eta1 = nn.Parameter(torch.tensor(0.001))
 
     def forward(self, e: torch.Tensor) -> torch.Tensor:
@@ -122,13 +175,14 @@ class DeepSparseModule(nn.Module):
     """Eq. 14 with the threshold in the learned transform domain."""
 
     def __init__(self, channels: int, width: int, kernel_t: int, sparse_domain: str,
-                 max_threshold: Optional[float], ds_residual: bool = True):
+                 max_threshold: Optional[float], ds_residual: bool = True,
+                 conv_mode: str = "joint", use_se: bool = False):
         super().__init__()
         if sparse_domain not in ("yt", "yf"):
             raise ValueError(f"sparse_domain must be 'yt' or 'yf', got {sparse_domain!r}")
         self.ds_residual = ds_residual
-        self.psi2 = conv_stack(channels, width, 3, width, kernel_t)  # forward transform -> width-ch domain
-        self.psi3 = conv_stack(width, channels, 3, width, kernel_t)  # inverse transform
+        self.psi2 = conv_stack(channels, width, 3, width, kernel_t, conv_mode, use_se)
+        self.psi3 = conv_stack(width, channels, 3, width, kernel_t, conv_mode, use_se)
         # lambda = exp(log_threshold), init 0.001 (paper). Stored in log space so
         # it is always > 0 and its gradient never vanishes: a plain parameter
         # clamped at 0 was pushed negative within the first steps of a real
@@ -173,11 +227,13 @@ class DeepSparseModule(nn.Module):
 
 class ODLSPhase(nn.Module):
     def __init__(self, channels: int, width: int, kernel_t: int, sparse_domain: str,
-                 max_threshold: Optional[float], ds_residual: bool):
+                 max_threshold: Optional[float], ds_residual: bool,
+                 conv_mode: str = "joint", use_se: bool = False):
         super().__init__()
-        self.dlr = DeepLowRankModule(channels, width, kernel_t)
+        self.dlr = DeepLowRankModule(channels, width, kernel_t, conv_mode, use_se)
         self.dc = DataConsistencyModule()
-        self.ds = DeepSparseModule(channels, width, kernel_t, sparse_domain, max_threshold, ds_residual)
+        self.ds = DeepSparseModule(channels, width, kernel_t, sparse_domain, max_threshold,
+                                   ds_residual, conv_mode, use_se)
 
     def forward(self, e, z, mask, need_sym: bool = True):
         r = self.dlr(e)
@@ -187,14 +243,18 @@ class ODLSPhase(nn.Module):
 
 class ODLSDynamic(nn.Module):
     def __init__(self, n_coils: int = 8, n_phases: int = 10, width: int = 48, kernel_t: int = 3,
-                 sparse_domain: str = "yt", max_threshold: Optional[float] = None, ds_residual: bool = True):
+                 sparse_domain: str = "yt", max_threshold: Optional[float] = None, ds_residual: bool = True,
+                 conv_mode: str = "joint", use_se: bool = False):
         super().__init__()
+        if conv_mode not in ("joint", "separable"):
+            raise ValueError(f"conv_mode must be 'joint' or 'separable', got {conv_mode!r}")
         self.config: Dict = dict(n_coils=n_coils, n_phases=n_phases, width=width, kernel_t=kernel_t,
                                  sparse_domain=sparse_domain, max_threshold=max_threshold,
-                                 ds_residual=ds_residual)
+                                 ds_residual=ds_residual, conv_mode=conv_mode, use_se=use_se)
         channels = 2 * n_coils
         self.phases = nn.ModuleList([
-            ODLSPhase(channels, width, kernel_t, sparse_domain, max_threshold, ds_residual)
+            ODLSPhase(channels, width, kernel_t, sparse_domain, max_threshold, ds_residual,
+                      conv_mode, use_se)
             for _ in range(n_phases)
         ])
         for m in self.modules():

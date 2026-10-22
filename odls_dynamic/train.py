@@ -72,6 +72,11 @@ def build_argparser() -> argparse.ArgumentParser:
                         "Eq. 14 literally.")
     p.add_argument("--max-threshold", type=optional_float, default=None,
                    help="Optional cap on each phase's soft-threshold (default: none, as in the paper).")
+    p.add_argument("--conv-mode", choices=["joint", "separable"], default="joint",
+                   help="'joint' = single (3, kernel_t) conv (default); 'separable' = (3,1) along ky "
+                        "then (1, kernel_t) along t (33%% fewer params per layer).")
+    p.add_argument("--use-se", action=argparse.BooleanOptionalAction, default=False,
+                   help="Add squeeze-and-excitation channel-attention after each conv stack.")
     # optimisation
     p.add_argument("--batch-size", type=int, default=32,
                    help="Rows per batch for a median-size (144 ky x 22 frames) slice; scaled per slice "
@@ -109,7 +114,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def model_config_from_args(args, n_coils: int) -> Dict:
     return dict(n_coils=n_coils, n_phases=args.n_phases, width=args.width, kernel_t=args.kernel_t,
                 sparse_domain=args.sparse_domain, max_threshold=args.max_threshold,
-                ds_residual=args.ds_residual)
+                ds_residual=args.ds_residual, conv_mode=args.conv_mode, use_se=args.use_se)
 
 
 def log_line(checkpoint_dir: str, msg: str) -> None:

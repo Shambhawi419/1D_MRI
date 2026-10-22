@@ -110,8 +110,11 @@ def test_dataset_and_sampler(data_dir):
 
 def test_model_gradients():
     torch.manual_seed(0)
-    for kt, dom, res in ((3, "yt", True), (3, "yf", True), (1, "yt", True), (3, "yt", False)):
-        model = ODLSDynamic(n_coils=2, n_phases=2, width=8, kernel_t=kt, sparse_domain=dom, ds_residual=res)
+    for kt, dom, res, cm, se in ((3, "yt", True, "joint", False), (3, "yf", True, "joint", False),
+                                  (1, "yt", True, "joint", False), (3, "yt", False, "joint", False),
+                                  (3, "yt", True, "separable", False), (3, "yt", True, "separable", True)):
+        model = ODLSDynamic(n_coils=2, n_phases=2, width=8, kernel_t=kt, sparse_domain=dom,
+                            ds_residual=res, conv_mode=cm, use_se=se)
         z, ref = torch.randn(3, 4, 12, 6), torch.randn(3, 4, 12, 6)
         mask = (torch.rand(3, 1, 12, 6) > 0.5).float()
         e_preds, sym = model(z, mask)
@@ -127,7 +130,7 @@ def test_model_gradients():
     with torch.no_grad():
         rel = (ds(d, need_sym=False)[0] - d).norm() / d.norm()
     assert rel < 0.05, f"residual DS should start near identity, got rel. change {rel:.3f}"
-    ok("model: every parameter gets a gradient (yt, yf, kernel_t=1, literal Eq. 14); "
+    ok("model: every parameter gets a gradient (yt, yf, kernel_t=1, literal Eq. 14, separable, SE); "
        "eval skips the symmetry pass; residual DS starts as identity")
 
 
